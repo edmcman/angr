@@ -1,5 +1,9 @@
 import claripy
 
+import logging
+l = logging.getLogger(__name__)
+
+
 from . import MemoryMixin
 from ... import sim_options as options
 from ... import concretization_strategies
@@ -252,6 +256,8 @@ class AddressConcretizationMixin(MemoryMixin):
             except SimMemoryError as e:
                 # If option...
                 faulting_exception = e
+                if not trivial:
+                    l.warning("Failed to load memory from concretized address %#x of %s: %s", concrete_addr, addr, e)
                 continue
 
             # quick optimization to not introduce the DUMMY value if there's only one loop
@@ -302,6 +308,8 @@ class AddressConcretizationMixin(MemoryMixin):
                 nonfaulting_concrete_addrs.append(concrete_addr)
             except SimMemoryError as e:
                 faulting_exception = e
+                if not trivial:
+                    l.warning("Failed to store memory from concretized address %#x of %s: %s", concrete_addr, addr, e)
                 continue
 
         if not trivial:
