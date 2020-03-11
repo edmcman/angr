@@ -228,15 +228,13 @@ class AddressConcretizationMixin(MemoryMixin):
             else:
                 raise
 
-        # quick optimization so as to not involve the solver if not necessary
-        trivial = type(addr) is int or (len(concrete_addrs) == 1 and (addr == concrete_addrs[0]).is_true())
-        if not trivial:
-            # apply the concretization results to the state
-            constraint_options = [addr == concrete_addr for concrete_addr in concrete_addrs]
-            conditional_constraint = self.state.solver.Or(*constraint_options)
-            self._add_constraints(conditional_constraint, condition=condition, **kwargs)
+        nonfaulting_concrete_addrs = []
+        faulting_exception = None
 
         read_value = DUMMY_SYMBOLIC_READ_VALUE  # this is a sentinel value and should never be touched
+
+        # quick optimization so as to not involve the solver if not necessary
+        trivial = type(addr) is int or (len(concrete_addrs) == 1 and (addr == concrete_addrs[0]).is_true())
 
         for concrete_addr in concrete_addrs:
             # perform each of the loads
@@ -248,13 +246,29 @@ class AddressConcretizationMixin(MemoryMixin):
                 if condition is not None:
                     sub_condition = condition & sub_condition
 
-            sub_value = super().load(concrete_addr, size=size, condition=sub_condition, **kwargs)
+            try:
+                sub_value = super().load(concrete_addr, size=size, condition=sub_condition, **kwargs)
+                nonfaulting_concrete_addrs.append(concrete_addr)
+            except SimMemoryError as e:
+                # If option...
+                faulting_exception = e
+                continue
 
             # quick optimization to not introduce the DUMMY value if there's only one loop
             if len(concrete_addrs) == 1:
                 read_value = sub_value
             else:
                 read_value = self.state.solver.If(addr == concrete_addr, sub_value, read_value)
+
+        if not trivial:
+            # apply the concretization results to the state
+            constraint_options = [addr == concrete_addr for concrete_addr in nonfaulting_concrete_addrs]
+            conditional_constraint = self.state.solver.Or(*constraint_options)
+            self._add_constraints(conditional_constraint, condition=condition, **kwargs)
+
+        if nonfaulting_concrete_addrs == []:
+            # XXX: What if concretize_read_addr returns []?
+            raise faulting_exception
 
         return read_value
 
@@ -267,13 +281,11 @@ class AddressConcretizationMixin(MemoryMixin):
             else:
                 raise
 
+        nonfaulting_concrete_addrs = []
+        faulting_exception = None
+
         # quick optimization so as to not involve the solver if not necessary
         trivial = type(addr) is int or (len(concrete_addrs) == 1 and (addr == concrete_addrs[0]).is_true())
-        if not trivial:
-            # apply the concretization results to the state
-            constraint_options = [addr == concrete_addr for concrete_addr in concrete_addrs]
-            conditional_constraint = self.state.solver.Or(*constraint_options)
-            self._add_constraints(conditional_constraint, condition=condition, **kwargs)
 
         for concrete_addr in concrete_addrs:
             # perform each of the stores as conditional
@@ -284,7 +296,24 @@ class AddressConcretizationMixin(MemoryMixin):
                 sub_condition = addr == concrete_addr
                 if condition is not None:
                     sub_condition = condition & sub_condition
-            super().store(concrete_addr, data, size=size, condition=sub_condition, **kwargs)
+
+            try:
+                super().store(concrete_addr, data, size=size, condition=sub_condition, **kwargs)
+                nonfaulting_concrete_addrs.append(concrete_addr)
+            except SimMemoryError as e:
+                faulting_exception = e
+                continue
+
+        if not trivial:
+            # apply the concretization results to the state
+            constraint_options = [addr == concrete_addr for concrete_addr in concrete_addrs]
+            conditional_constraint = self.state.solver.Or(*constraint_options)
+            self._add_constraints(conditional_constraint, condition=condition, **kwargs)
+
+        if nonfaulting_concrete_addrs == []:
+            # XXX: What if concretize_read_addr returns []?
+            raise faulting_exception
+
 
     def permissions(self, addr, permissions=None, **kwargs):
         if type(addr) is int:
