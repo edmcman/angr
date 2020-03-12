@@ -774,17 +774,13 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
 
         try:
             req.actual_addresses = sorted(self.concretize_write_addr(req.addr))
+            tmp_actual_addresses = []
+            saved_exception = SimMemoryError()
         except SimMemoryError:
             if options.CONSERVATIVE_WRITE_STRATEGY in self.state.options:
                 return req
             else:
                 raise
-
-        if type(req.addr) is not int and req.addr.symbolic:
-            conditional_constraint = self.state.solver.Or(*[ req.addr == a for a in req.actual_addresses ])
-            if (conditional_constraint.symbolic or  # if the constraint is symbolic
-                    conditional_constraint.is_false()):  # if it makes the state go unsat
-                req.constraints.append(conditional_constraint)
 
         #
         # Prepare memory objects
@@ -814,14 +810,33 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
                     store_item['value'] = store_item['value'].reversed
 
                 req.stored_values.append(store_item['value'])
-                self._insert_memory_object(store_item['value'], store_item['addr'], store_item['size'])
+                try:
+                    self._insert_memory_object(store_item['value'], store_item['addr'], store_item['size'])
+                    tmp_actual_addresses.append(store_item['addr'])
+                except SimMemoryError as e:
+                    saved_exception = e
         else:
             for store_item in store_list:
                 if req.endness == "Iend_LE" or (req.endness is None and self.endness == "Iend_LE"):
                     store_item['value'] = store_item['value'].reversed
 
                 req.stored_values.append(store_item['value'])
-                self._insert_memory_object(store_item['value'], store_item['addr'], store_item['size'])
+                try:
+                    self._insert_memory_object(store_item['value'], store_item['addr'], store_item['size'])
+                    tmp_actual_addresses.append(store_item['addr'])
+                except SimMemoryError as e:
+                    saved_exception = e
+
+        req.actual_addresses = tmp_actual_addresses
+        if req.actual_addresses == []:
+            raise saved_exception
+
+        if type(req.addr) is not int and req.addr.symbolic:
+            conditional_constraint = self.state.solver.Or(*[ req.addr == a for a in req.actual_addresses ])
+            if (conditional_constraint.symbolic or  # if the constraint is symbolic
+                conditional_constraint.is_false()):  # if it makes the state go unsat
+                req.constraints.append(conditional_constraint)
+
 
         l.debug("... done")
         req.completed = True
