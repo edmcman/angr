@@ -804,6 +804,19 @@ class ErrorRecord:
     def __eq__(self, other):
         return self is other or self.state is other
 
+    #
+    # Pickling
+    #
+
+    # traceback objects are not picklable :-(
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state['traceback'] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+
 
 from .errors import SimError, SimMergeError
 from .sim_state import SimState
