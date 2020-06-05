@@ -1,3 +1,4 @@
+from typing import Optional
 import logging
 import collections.abc
 from sortedcontainers import SortedDict
@@ -78,6 +79,8 @@ class FunctionManager(KnowledgeBasePlugin, collections.abc.Mapping):
     def copy(self):
         fm = FunctionManager(self._kb)
         fm._function_map = self._function_map.copy()
+        for address, function in fm._function_map.items():
+            fm._function_map[address] = function.copy()
         fm.callgraph = networkx.MultiDiGraph(self.callgraph)
         fm._arg_registers = self._arg_registers.copy()
 
@@ -183,15 +186,16 @@ class FunctionManager(KnowledgeBasePlugin, collections.abc.Mapping):
             from_node = self._kb._project.factory.snippet(from_node)
         self._function_map[function_addr]._add_return_site(from_node)
 
-    def _add_transition_to(self, function_addr, from_node, to_node, ins_addr=None, stmt_idx=None):
+    def _add_transition_to(self, function_addr, from_node, to_node, ins_addr=None, stmt_idx=None, is_exception=False):
         if isinstance(from_node, self.address_types):  # pylint: disable=unidiomatic-typecheck
             from_node = self._kb._project.factory.snippet(from_node)
         if isinstance(to_node, self.address_types):  # pylint: disable=unidiomatic-typecheck
             to_node = self._kb._project.factory.snippet(to_node)
-        self._function_map[function_addr]._transit_to(from_node, to_node, ins_addr=ins_addr, stmt_idx=stmt_idx)
+        self._function_map[function_addr]._transit_to(from_node, to_node, ins_addr=ins_addr, stmt_idx=stmt_idx,
+                                                      is_exception=is_exception)
 
     def _add_outside_transition_to(self, function_addr, from_node, to_node, to_function_addr=None, ins_addr=None,
-                                   stmt_idx=None):
+                                   stmt_idx=None, is_exception=False):
         if type(from_node) is int:  # pylint: disable=unidiomatic-typecheck
             from_node = self._kb._project.factory.snippet(from_node)
         if type(to_node) is int:  # pylint: disable=unidiomatic-typecheck
@@ -202,12 +206,12 @@ class FunctionManager(KnowledgeBasePlugin, collections.abc.Mapping):
                 self._function_map[function_addr].add_jumpout_site(from_node)
                 return
         self._function_map[function_addr]._transit_to(from_node, to_node, outside=True, ins_addr=ins_addr,
-                                                      stmt_idx=stmt_idx
+                                                      stmt_idx=stmt_idx, is_exception=is_exception,
                                                       )
 
         if to_function_addr is not None:
             # mark it on the callgraph
-            edge_data = {'type': 'transition'}
+            edge_data = {'type': 'transition' if not is_exception else 'exception'}
             if function_addr not in self.callgraph or \
                     to_function_addr not in self.callgraph[function_addr] or \
                     edge_data not in self.callgraph[function_addr][to_function_addr].values():
@@ -239,7 +243,7 @@ class FunctionManager(KnowledgeBasePlugin, collections.abc.Mapping):
         except KeyError:
             return False
 
-    def __getitem__(self, k):
+    def __getitem__(self, k) -> Function:
         if isinstance(k, self.function_address_types):
             f = self.function(addr=k)
         elif type(k) is str:
@@ -274,15 +278,15 @@ class FunctionManager(KnowledgeBasePlugin, collections.abc.Mapping):
         for i in sorted(self._function_map.keys()):
             yield i
 
-    def get_by_addr(self, addr):
+    def get_by_addr(self, addr) -> Function:
         return self._function_map.get(addr)
 
-    def _function_added(self, func):
+    def _function_added(self, func: Function):
         """
         A callback method for adding a new function instance to the manager.
 
-        :param Function func:   The Function instance being added.
-        :return:                None
+        :param func:   The Function instance being added.
+        :return:       None
         """
 
         # make sure all functions exist in the call graph
@@ -330,7 +334,7 @@ class FunctionManager(KnowledgeBasePlugin, collections.abc.Mapping):
         except KeyError:
             return None
 
-    def function(self, addr=None, name=None, create=False, syscall=False, plt=None):
+    def function(self, addr=None, name=None, create=False, syscall=False, plt=None) -> Optional[Function]:
         """
         Get a function object from the function manager.
 

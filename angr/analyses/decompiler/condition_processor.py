@@ -1,4 +1,4 @@
-
+import operator
 import logging
 
 import networkx
@@ -6,7 +6,7 @@ import networkx
 import claripy
 import ailment
 
-from ...utils.graph import dominates
+from ...utils.graph import dominates, shallow_reverse
 from ...block import Block, BlockNode
 from ..cfg.cfg_utils import CFGUtils
 from .structurer_nodes import (EmptyBlockNotice, SequenceNode, CodeNode, SwitchCaseNode, BreakNode,
@@ -44,20 +44,26 @@ class ConditionProcessor:
             if len(nodes) >= 1:
                 for dst in nodes:
                     edge = src, dst
-                    predicate = self._extract_predicate(src, dst)
+                    edge_data = region.graph.get_edge_data(*edge)
+                    edge_type = edge_data.get('type', 'transition')
+                    try:
+                        predicate = self._extract_predicate(src, dst, edge_type)
+                    except EmptyBlockNotice:
+                        # catch empty block notice - although this should not really happen
+                        predicate = claripy.true
                     edge_conditions[edge] = predicate
                     predicate_mapping[predicate] = dst
 
         if jump_tables:
             self.recover_reaching_conditions_for_jumptables(region, jump_tables, edge_conditions)
 
-        if with_successors:
+        if with_successors and region.graph_with_successors is not None:
             _g = region.graph_with_successors
         else:
             _g = region.graph
         end_nodes = {n for n in _g.nodes() if _g.out_degree(n) == 0}
         if end_nodes:
-            inverted_graph = networkx.reverse(_g)
+            inverted_graph = shallow_reverse(_g)
             if len(end_nodes) > 1:
                 # make sure there is only one end node
                 dummy_node = "DUMMY_NODE"
@@ -137,14 +143,17 @@ class ConditionProcessor:
                 edge = node_a, addr2nodes[entry_addr]
                 edge_conditions[edge] = cond
 
-    def remove_claripy_bool_asts(self, node):
+    def remove_claripy_bool_asts(self, node, memo=None):
 
         # Convert claripy Bool ASTs to AIL expressions
+
+        if memo is None:
+            memo = {}
 
         if isinstance(node, SequenceNode):
             new_nodes = [ ]
             for n in node.nodes:
-                new_node = self.remove_claripy_bool_asts(n)
+                new_node = self.remove_claripy_bool_asts(n, memo=memo)
                 new_nodes.append(new_node)
             new_seq_node = SequenceNode(new_nodes)
             return new_seq_node
@@ -152,21 +161,21 @@ class ConditionProcessor:
         elif isinstance(node, MultiNode):
             new_nodes = [ ]
             for n in node.nodes:
-                new_node = self.remove_claripy_bool_asts(n)
+                new_node = self.remove_claripy_bool_asts(n, memo=memo)
                 new_nodes.append(new_node)
             new_multinode = MultiNode(nodes=new_nodes)
             return new_multinode
 
         elif isinstance(node, CodeNode):
-            node = CodeNode(self.remove_claripy_bool_asts(node.node),
+            node = CodeNode(self.remove_claripy_bool_asts(node.node, memo=memo),
                             None if node.reaching_condition is None
-                            else self.convert_claripy_bool_ast(node.reaching_condition))
+                            else self.convert_claripy_bool_ast(node.reaching_condition, memo=memo))
             return node
 
         elif isinstance(node, ConditionalBreakNode):
 
             return ConditionalBreakNode(node.addr,
-                                        self.convert_claripy_bool_ast(node.condition),
+                                        self.convert_claripy_bool_ast(node.condition, memo=memo),
                                         node.target,
                                         )
 
@@ -174,72 +183,148 @@ class ConditionProcessor:
 
             return ConditionNode(node.addr,
                                  None if node.reaching_condition is None else
-                                    self.convert_claripy_bool_ast(node.reaching_condition),
-                                 self.convert_claripy_bool_ast(node.condition),
-                                 self.remove_claripy_bool_asts(node.true_node),
-                                 self.remove_claripy_bool_asts(node.false_node),
+                                    self.convert_claripy_bool_ast(node.reaching_condition, memo=memo),
+                                 self.convert_claripy_bool_ast(node.condition, memo=memo),
+                                 self.remove_claripy_bool_asts(node.true_node, memo=memo),
+                                 self.remove_claripy_bool_asts(node.false_node, memo=memo),
                                  )
 
         elif isinstance(node, LoopNode):
 
             return LoopNode(node.sort,
-                            self.convert_claripy_bool_ast(node.condition) if node.condition is not None else None,
-                            self.remove_claripy_bool_asts(node.sequence_node),
+                            self.convert_claripy_bool_ast(node.condition, memo=memo) if node.condition is not None else None,
+                            self.remove_claripy_bool_asts(node.sequence_node, memo=memo),
                             addr=node.addr,
                             )
 
         elif isinstance(node, SwitchCaseNode):
-            return SwitchCaseNode(self.convert_claripy_bool_ast(node.switch_expr),
-                                  dict((idx, self.remove_claripy_bool_asts(case_node))
+            return SwitchCaseNode(self.convert_claripy_bool_ast(node.switch_expr, memo=memo),
+                                  dict((idx, self.remove_claripy_bool_asts(case_node, memo=memo))
                                        for idx, case_node in node.cases.items()),
-                                  self.remove_claripy_bool_asts(node.default_node),
+                                  self.remove_claripy_bool_asts(node.default_node, memo=memo),
                                   addr=node.addr)
 
         else:
             return node
 
-    def get_last_statement(self, block):
+    @classmethod
+    def get_last_statement(cls, block):
+        """
+        This is the buggy version of get_last_statements, because, you know, there can always be more than one last
+        statement due to the existence of branching statements (like, If-then-else). All methods using
+        get_last_statement() should switch to get_last_statements() and properly handle multiple last statements.
+        """
         if type(block) is SequenceNode:
             if block.nodes:
-                return self.get_last_statement(block.nodes[-1])
-        elif type(block) is CodeNode:
-            return self.get_last_statement(block.node)
-        elif type(block) is ailment.Block:
+                return cls.get_last_statement(block.nodes[-1])
+            raise EmptyBlockNotice()
+        if type(block) is CodeNode:
+            return cls.get_last_statement(block.node)
+        if type(block) is ailment.Block:
             if not block.statements:
                 raise EmptyBlockNotice()
             return block.statements[-1]
-        elif type(block) is Block:
+        if type(block) is Block:
             raise NotImplementedError()
-        elif type(block) is BlockNode:
+        if type(block) is BlockNode:
             raise NotImplementedError()
-        elif type(block) is MultiNode:
+        if type(block) is MultiNode:
             # get the last node
             for the_block in reversed(block.nodes):
                 try:
-                    last_stmt = self.get_last_statement(the_block)
+                    last_stmt = cls.get_last_statement(the_block)
                     return last_stmt
                 except EmptyBlockNotice:
                     continue
-        elif type(block) is LoopNode:
-            return self.get_last_statement(block.sequence_node)
-        elif type(block) is ConditionalBreakNode:
+            raise EmptyBlockNotice()
+        if type(block) is LoopNode:
+            return cls.get_last_statement(block.sequence_node)
+        if type(block) is ConditionalBreakNode:
             return None
-        elif type(block) is ConditionNode:
+        if type(block) is ConditionNode:
             s = None
             if block.true_node:
-                s = self.get_last_statement(block.true_node)
+                try:
+                    s = cls.get_last_statement(block.true_node)
+                except EmptyBlockNotice:
+                    s = None
             if s is None and block.false_node:
-                s = self.get_last_statement(block.false_node)
+                s = cls.get_last_statement(block.false_node)
             return s
-        elif type(block) is BreakNode:
+        if type(block) is BreakNode:
             return None
-        elif type(block) is ContinueNode:
+        if type(block) is ContinueNode:
             return None
-        elif type(block) is SwitchCaseNode:
+        if type(block) is SwitchCaseNode:
             return None
-        elif type(block) is GraphRegion:
+        if type(block) is GraphRegion:
             # normally this should not happen. however, we have test cases that trigger this case.
             return None
+
+        raise NotImplementedError()
+
+    @classmethod
+    def get_last_statements(cls, block):
+        if type(block) is SequenceNode:
+            for last_node in reversed(block.nodes):
+                try:
+                    last_stmts = cls.get_last_statements(last_node)
+                    return last_stmts
+                except EmptyBlockNotice:
+                    # the node is empty. try the next one
+                    continue
+
+            raise EmptyBlockNotice()
+
+        if type(block) is CodeNode:
+            return cls.get_last_statements(block.node)
+        if type(block) is ailment.Block:
+            if not block.statements:
+                raise EmptyBlockNotice()
+            return [ block.statements[-1] ]
+        if type(block) is Block:
+            raise NotImplementedError()
+        if type(block) is BlockNode:
+            raise NotImplementedError()
+        if type(block) is MultiNode:
+            # get the last node
+            for the_block in reversed(block.nodes):
+                try:
+                    last_stmts = cls.get_last_statements(the_block)
+                    return last_stmts
+                except EmptyBlockNotice:
+                    continue
+            raise EmptyBlockNotice()
+        if type(block) is LoopNode:
+            return cls.get_last_statements(block.sequence_node)
+        if type(block) is ConditionalBreakNode:
+            return [ block ]
+        if type(block) is ConditionNode:
+            s = [ ]
+            if block.true_node:
+                try:
+                    last_stmts = cls.get_last_statements(block.true_node)
+                    s.extend(last_stmts)
+                except EmptyBlockNotice:
+                    pass
+            if block.false_node:
+                last_stmts = cls.get_last_statements(block.false_node)
+                s.extend(last_stmts)
+            return s
+        if type(block) is BreakNode:
+            return [ block ]
+        if type(block) is ContinueNode:
+            return [ block ]
+        if type(block) is SwitchCaseNode:
+            s = [ ]
+            for case in block.cases.values():
+                s.extend(cls.get_last_statements(case))
+            if block.default_node is not None:
+                s.extend(cls.get_last_statements(block.default_node))
+            return s
+        if type(block) is GraphRegion:
+            # normally this should not happen. however, we have test cases that trigger this case.
+            return [ ]
 
         raise NotImplementedError()
 
@@ -247,7 +332,17 @@ class ConditionProcessor:
     # Path predicate
     #
 
-    def _extract_predicate(self, src_block, dst_block):
+    EXC_COUNTER = 1000
+
+    def _extract_predicate(self, src_block, dst_block, edge_type):
+
+        if edge_type == 'exception':
+            # TODO: THIS IS ABSOLUTELY A HACK. AT THIS MOMENT YOU SHOULD NOT ATTEMPT TO MAKE SENSE OF EXCEPTION EDGES.
+            self.EXC_COUNTER += 1
+            return self.claripy_ast_from_ail_condition(
+                ailment.Expr.BinaryOp(None, 'CmpEQ', (ailment.Expr.Register(0x400000 + self.EXC_COUNTER, None, self.EXC_COUNTER, 64),
+                                                      ailment.Expr.Const(None, None, self.EXC_COUNTER, 64)), False)
+            )
 
         if type(src_block) is ConditionalBreakNode:
             # at this point ConditionalBreakNode stores a claripy AST
@@ -272,7 +367,7 @@ class ConditionProcessor:
             return target_ast == dst_block.addr
         if type(last_stmt) is ailment.Stmt.ConditionalJump:
             bool_var = self.claripy_ast_from_ail_condition(last_stmt.condition)
-            if last_stmt.true_target.value == dst_block.addr:
+            if isinstance(last_stmt.true_target, ailment.Expr.Const) and last_stmt.true_target.value == dst_block.addr:
                 return bool_var
             else:
                 return claripy.Not(bool_var)
@@ -283,13 +378,22 @@ class ConditionProcessor:
     # Expression conversion
     #
 
-    def convert_claripy_bool_ast(self, cond):
+    def convert_claripy_bool_ast(self, cond, memo=None):
         """
         Convert recovered reaching conditions from claripy ASTs to ailment Expressions
 
         :return: None
         """
 
+        if memo is None:
+            memo = {}
+        if cond in memo:
+            return memo[cond]
+        r = self.convert_claripy_bool_ast_core(cond, memo)
+        memo[cond] = r
+        return r
+
+    def convert_claripy_bool_ast_core(self, cond, memo):
         if isinstance(cond, ailment.Expr.Expression):
             return cond
 
@@ -302,75 +406,38 @@ class ConditionProcessor:
             r = None
             for arg in args:
                 if r is None:
-                    r = self.convert_claripy_bool_ast(arg)
+                    r = self.convert_claripy_bool_ast(arg, memo=memo)
                 else:
-                    r = ailment.Expr.BinaryOp(None, op, (r, self.convert_claripy_bool_ast(arg)), signed)
+                    r = ailment.Expr.BinaryOp(None, op, (r, self.convert_claripy_bool_ast(arg, memo=memo)), signed)
             return r
 
         _mapping = {
-            'Not': lambda cond_: ailment.Expr.UnaryOp(None, 'Not', self.convert_claripy_bool_ast(cond_.args[0])),
+            'Not': lambda cond_: _binary_op_reduce('Not', cond_.args),
             'And': lambda cond_: _binary_op_reduce('LogicalAnd', cond_.args),
             'Or': lambda cond_: _binary_op_reduce('LogicalOr', cond_.args),
-            '__le__': lambda cond_: ailment.Expr.BinaryOp(None, 'CmpLE',
-                                                          tuple(map(self.convert_claripy_bool_ast, cond_.args)),
-                                                          True),
-            'SLE': lambda cond_: ailment.Expr.BinaryOp(None, 'CmpLE',
-                                                       tuple(map(self.convert_claripy_bool_ast, cond_.args)),
-                                                       True),
-            '__lt__': lambda cond_: ailment.Expr.BinaryOp(None, 'CmpLT',
-                                                          tuple(map(self.convert_claripy_bool_ast, cond_.args)),
-                                                          True),
-            'SLT': lambda cond_: ailment.Expr.BinaryOp(None, 'CmpLT',
-                                                       tuple(map(self.convert_claripy_bool_ast, cond_.args)),
-                                                       True),
-            'UGT': lambda cond_: ailment.Expr.BinaryOp(None, 'CmpGT',
-                                                       tuple(map(self.convert_claripy_bool_ast, cond_.args)),
-                                                       False),
-            'UGE': lambda cond_: ailment.Expr.BinaryOp(None, 'CmpGE',
-                                                       tuple(map(self.convert_claripy_bool_ast, cond_.args)),
-                                                       False),
-            '__gt__': lambda cond_: ailment.Expr.BinaryOp(None, 'CmpGT',
-                                                          tuple(map(self.convert_claripy_bool_ast, cond_.args)),
-                                                          True),
-            '__ge__': lambda cond_: ailment.Expr.BinaryOp(None, 'CmpGE',
-                                                          tuple(map(self.convert_claripy_bool_ast, cond_.args)),
-                                                          True),
-            'SGT': lambda cond_: ailment.Expr.BinaryOp(None, 'CmpGT',
-                                                       tuple(map(self.convert_claripy_bool_ast, cond_.args)),
-                                                       True),
-            'SGE': lambda cond_: ailment.Expr.BinaryOp(None, 'CmpGE',
-                                                       tuple(map(self.convert_claripy_bool_ast, cond_.args)),
-                                                       True),
-            'ULT': lambda cond_: ailment.Expr.BinaryOp(None, 'CmpLT',
-                                                       tuple(map(self.convert_claripy_bool_ast, cond_.args)),
-                                                       False),
-            'ULE': lambda cond_: ailment.Expr.BinaryOp(None, 'CmpLE',
-                                                       tuple(map(self.convert_claripy_bool_ast, cond_.args)),
-                                                       False),
-            '__eq__': lambda cond_: ailment.Expr.BinaryOp(None, 'CmpEQ',
-                                                          tuple(map(self.convert_claripy_bool_ast, cond_.args)),
-                                                          False),
-            '__ne__': lambda cond_: ailment.Expr.BinaryOp(None, 'CmpNE',
-                                                          tuple(map(self.convert_claripy_bool_ast, cond_.args)),
-                                                          False),
-            '__add__': lambda cond_: ailment.Expr.BinaryOp(None, 'Add',
-                                                           tuple(map(self.convert_claripy_bool_ast, cond_.args)),
-                                                           False),
-            '__sub__': lambda cond_: ailment.Expr.BinaryOp(None, 'Sub',
-                                                           tuple(map(self.convert_claripy_bool_ast, cond_.args)),
-                                                           False),
-            '__xor__': lambda cond_: ailment.Expr.BinaryOp(None, 'Xor',
-                                                           tuple(map(self.convert_claripy_bool_ast, cond_.args)),
-                                                           False),
-            '__or__': lambda cond_: ailment.Expr.BinaryOp(None, 'Or',
-                                                          tuple(map(self.convert_claripy_bool_ast, cond_.args)),
-                                                          False),
-            '__and__': lambda cond_: ailment.Expr.BinaryOp(None, 'And',
-                                                           tuple(map(self.convert_claripy_bool_ast, cond_.args)),
-                                                           False),
-            'LShR': lambda cond_: ailment.Expr.BinaryOp(None, 'Shr',
-                                                        tuple(map(self.convert_claripy_bool_ast, cond_.args)),
-                                                        False),
+            '__le__': lambda cond_: _binary_op_reduce('CmpLE', cond_.args, signed=True),
+            'SLE': lambda cond_: _binary_op_reduce('CmpLE', cond_.args, signed=True),
+            '__lt__': lambda cond_: _binary_op_reduce('CmpLT', cond_.args, signed=True),
+            'SLT': lambda cond_: _binary_op_reduce('CmpLT', cond_.args, signed=True),
+            'UGT': lambda cond_: _binary_op_reduce('CmpGT', cond_.args),
+            'UGE': lambda cond_: _binary_op_reduce('CmpGE', cond_.args),
+            '__gt__': lambda cond_: _binary_op_reduce('CmpGT', cond_.args, signed=True),
+            '__ge__': lambda cond_: _binary_op_reduce('CmpGE', cond_.args, signed=True),
+            'SGT': lambda cond_: _binary_op_reduce('CmpGT', cond_.args, signed=True),
+            'SGE': lambda cond_: _binary_op_reduce('CmpGE', cond_.args, signed=True),
+            'ULT': lambda cond_: _binary_op_reduce('CmpLT', cond_.args),
+            'ULE': lambda cond_: _binary_op_reduce('CmpLE', cond_.args),
+            '__eq__': lambda cond_: _binary_op_reduce('CmpEQ', cond_.args),
+            '__ne__': lambda cond_: _binary_op_reduce('CmpNE', cond_.args),
+            '__add__': lambda cond_: _binary_op_reduce('Add', cond_.args, signed=False),
+            '__sub__': lambda cond_: _binary_op_reduce('Sub', cond_.args),
+            '__mul__': lambda cond_: _binary_op_reduce('Mul', cond_.args),
+            '__xor__': lambda cond_: _binary_op_reduce('Xor', cond_.args),
+            '__or__': lambda cond_: _binary_op_reduce('Or', cond_.args, signed=False),
+            '__and__': lambda cond_: _binary_op_reduce('And', cond_.args),
+            '__lshift__': lambda cond_: _binary_op_reduce('Shl', cond_.args),
+            '__rshift__': lambda cond_: _binary_op_reduce('Sar', cond_.args),
+            'LShR': lambda cond_: _binary_op_reduce('Shr', cond_.args),
             'BVV': lambda cond_: ailment.Expr.Const(None, None, cond_.args[0], cond_.size()),
             'BoolV': lambda cond_: ailment.Expr.Const(None, None, True, 1) if cond_.args[0] is True
                                                                         else ailment.Expr.Const(None, None, False, 1),
@@ -387,6 +454,18 @@ class ConditionProcessor:
         if isinstance(condition, claripy.ast.Base):
             return condition
 
+        def _op_with_unified_size(op, conv, operand0, operand1):
+            # ensure operand1 is of the same size as operand0
+            if isinstance(operand1, ailment.Expr.Const):
+                # amazing - we do the eazy thing here
+                return op(conv(operand0), operand1.value)
+            if operand1.bits == operand0.bits:
+                return op(conv(operand0), conv(operand1))
+            # extension is required
+            assert operand1.bits < operand0.bits
+            operand1 = ailment.Expr.Convert(None, operand1.bits, operand0.bits, False, operand1)
+            return op(conv(operand0), conv(operand1))
+
         _mapping = {
             'LogicalAnd': lambda expr, conv: claripy.And(conv(expr.operands[0]), conv(expr.operands[1])),
             'LogicalOr': lambda expr, conv: claripy.Or(conv(expr.operands[0]), conv(expr.operands[1])),
@@ -402,14 +481,18 @@ class ConditionProcessor:
             'CmpGTs': lambda expr, conv: claripy.SGT(conv(expr.operands[0]), conv(expr.operands[1])),
             'Add': lambda expr, conv: conv(expr.operands[0]) + conv(expr.operands[1]),
             'Sub': lambda expr, conv: conv(expr.operands[0]) - conv(expr.operands[1]),
+            'Mul': lambda expr, conv: conv(expr.operands[0]) * conv(expr.operands[1]),
             'Not': lambda expr, conv: claripy.Not(conv(expr.operand)),
             'Xor': lambda expr, conv: conv(expr.operands[0]) ^ conv(expr.operands[1]),
             'And': lambda expr, conv: conv(expr.operands[0]) & conv(expr.operands[1]),
             'Or': lambda expr, conv: conv(expr.operands[0]) | conv(expr.operands[1]),
-            'Shr': lambda expr, conv: claripy.LShR(conv(expr.operands[0]), expr.operands[1].value)
+            'Shr': lambda expr, conv: _op_with_unified_size(claripy.LShR, conv, expr.operands[0], expr.operands[1]),
+            'Shl': lambda expr, conv: _op_with_unified_size(operator.lshift, conv, expr.operands[0], expr.operands[1]),
+            'Sar': lambda expr, conv: _op_with_unified_size(operator.rshift, conv, expr.operands[0], expr.operands[1]),
         }
 
-        if isinstance(condition, (ailment.Expr.Load, ailment.Expr.DirtyExpression, ailment.Expr.BasePointerOffset)):
+        if isinstance(condition, (ailment.Expr.Load, ailment.Expr.DirtyExpression, ailment.Expr.BasePointerOffset,
+                                  ailment.Expr.ITE)):
             var = claripy.BVS('ailexpr_%s' % repr(condition), condition.bits, explicit_name=True)
             self._condition_mapping[var] = condition
             return var
@@ -478,6 +561,10 @@ class ConditionProcessor:
 
         if cond.op != "Or":
             return cond
+
+        if len(cond.args) == 1:
+            # redundant operator. get rid of it
+            return cond.args[0]
 
         or_arg0, or_arg1 = cond.args[:2]
         if or_arg1.op == 'And':

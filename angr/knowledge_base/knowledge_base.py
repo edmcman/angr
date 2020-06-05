@@ -1,6 +1,15 @@
 """Representing the artifacts of a project."""
 
+from itertools import count
 import logging
+
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from ..project import Project
+    from ..knowledge_plugins import FunctionManager
+    from ..knowledge_plugins import VariableManager
+    from ..knowledge_plugins import KeyDefinitionManager
+    from ..knowledge_plugins import CFGManager
 
 from ..knowledge_plugins.plugin import default_plugins
 
@@ -8,16 +17,27 @@ from ..knowledge_plugins.plugin import default_plugins
 l = logging.getLogger(name=__name__)
 
 
+kb_ctr = count(0, 1)
+
+
 class KnowledgeBase:
     """Represents a "model" of knowledge about an artifact.
 
     Contains things like a CFG, data references, etc.
     """
-    def __init__(self, project, obj=None):
+    functions: 'FunctionManager'
+    variables: 'VariableManager'
+    defs: 'KeyDefinitionManager'
+    cfgs: 'CFGManager'
+    _project: 'Project'
+
+    def __init__(self, project, obj=None, name=None):
         if obj is not None:
             l.warning("The obj parameter in KnowledgeBase.__init__() has been deprecated.")
         object.__setattr__(self, '_project', project)
         object.__setattr__(self, '_plugins', {})
+
+        self.name = name if name else ("kb_%d" % next(kb_ctr))
 
     @property
     def callgraph(self):
@@ -43,7 +63,7 @@ class KnowledgeBase:
         return s
 
     def __dir__(self):
-        x = super(KnowledgeBase, self).__dir__()
+        x = list(super(KnowledgeBase, self).__dir__())
         x.extend(default_plugins.keys())
         return x
 

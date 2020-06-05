@@ -1,6 +1,7 @@
-
+from typing import Optional
 import logging
 
+from ..knowledge_plugins.cfg import CFGModel
 from ..analyses.cfg import CFGUtils
 from . import Analysis, register_analysis
 
@@ -9,10 +10,14 @@ _l = logging.getLogger(name=__name__)
 
 class CompleteCallingConventionsAnalysis(Analysis):
 
-    def __init__(self, recover_variables=False, low_priority=False):
+    def __init__(self, recover_variables=False, low_priority=False, force=False, cfg: Optional[CFGModel]=None,
+                 analyze_callsites: bool=False):
 
         self._recover_variables = recover_variables
         self._low_priority = low_priority
+        self._force = force
+        self._cfg = cfg
+        self._analyze_callsites = analyze_callsites
 
         self._analyze()
 
@@ -32,7 +37,7 @@ class CompleteCallingConventionsAnalysis(Analysis):
         for idx, func_addr in enumerate(reversed(sorted_funcs)):
             func = self.kb.functions.get_by_addr(func_addr)
 
-            if func.calling_convention is None:
+            if func.calling_convention is None or self._force:
                 if func.alignment:
                     # skil all alignments
                     continue
@@ -43,7 +48,8 @@ class CompleteCallingConventionsAnalysis(Analysis):
                     _ = self.project.analyses.VariableRecoveryFast(func, kb=self.kb, low_priority=self._low_priority)
 
                 # determine the calling convention of each function
-                cc_analysis = self.project.analyses.CallingConvention(func)
+                cc_analysis = self.project.analyses.CallingConvention(func, cfg=self._cfg,
+                                                                      analyze_callsites=self._analyze_callsites)
                 if cc_analysis.cc is not None:
                     _l.info("Determined calling convention for %r.", func)
                     func.calling_convention = cc_analysis.cc

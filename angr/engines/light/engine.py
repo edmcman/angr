@@ -5,10 +5,12 @@ import logging
 
 import ailment
 import pyvex
+import archinfo
 
+from ...engines.vex.claripy.irop import operations as vex_operations
+from ...code_location import CodeLocation
+from ...utils.constants import DEFAULT_STATEMENT
 from ..engine import SimEngine
-from angr.engines.vex.claripy.irop import operations as vex_operations
-from ...analyses.code_location import CodeLocation
 
 
 class SimEngineLight(SimEngine):
@@ -63,7 +65,7 @@ class SimEngineLightVEXMixin:
         self.state = state
 
         if state is not None:
-            self.arch = state.arch
+            self.arch: archinfo.Arch = state.arch
 
         self.tyenv = block.vex.tyenv
 
@@ -91,6 +93,7 @@ class SimEngineLightVEXMixin:
             self._handle_Stmt(stmt)
 
         if self.block.vex.jumpkind == 'Ijk_Call':
+            self.stmt_idx = DEFAULT_STATEMENT
             handler = '_handle_function'
             if hasattr(self, handler):
                 func_addr = self._expr(self.block.vex.next)
@@ -132,6 +135,12 @@ class SimEngineLightVEXMixin:
     def _handle_Store(self, stmt):
         raise NotImplementedError('Please implement the Store handler with your own logic.')
 
+    def _handle_StoreG(self, stmt):
+        raise NotImplementedError('Please implement the StoreG handler with your own logic.')
+
+    def _handle_LLSC(self, stmt: pyvex.IRStmt.LLSC):
+        raise NotImplementedError('Please implement the LLSC handler with your own logic.')
+
     #
     # Expression handlers
     #
@@ -158,6 +167,9 @@ class SimEngineLightVEXMixin:
     def _handle_Load(self, expr):
         raise NotImplementedError('Please implement the Load handler with your own logic.')
 
+    def _handle_LoadG(self, stmt):
+        raise NotImplementedError('Please implement the LoadG handler with your own logic.')
+
     def _handle_Exit(self, stmt):
         self._expr(stmt.guard)
         self._expr(stmt.dst)
@@ -177,7 +189,7 @@ class SimEngineLightVEXMixin:
 
         # All conversions are handled by the Conversion handler
         simop = vex_operations.get(expr.op)
-        if simop is not None and simop.op_attrs['conversion']:
+        if simop is not None and simop.op_attrs.get('conversion', None):
             handler = '_handle_Conversion'
         # Notice order of "Not" comparisons
         elif expr.op == 'Iop_Not1':
@@ -549,7 +561,7 @@ class SimEngineLightAILMixin:
             self.stmt_idx = stmt_idx
             self.ins_addr = stmt.ins_addr
 
-            self._ail_handle_Stmt(stmt)
+            self._handle_Stmt(stmt)
 
     def _expr(self, expr):
 
@@ -570,12 +582,19 @@ class SimEngineLightAILMixin:
     # Statement handlers
     #
 
-    def _ail_handle_Stmt(self, stmt):
-        handler = "_ail_handle_%s" % type(stmt).__name__
+    def _handle_Stmt(self, stmt):
+        handler = "_handle_%s" % type(stmt).__name__
         if hasattr(self, handler):
             getattr(self, handler)(stmt)
-        else:
-            self.l.warning('Unsupported statement type %s.', type(stmt).__name__)
+            return
+
+        # compatibility
+        old_handler = "_ail_handle_%s" % type(stmt).__name__
+        if hasattr(self, old_handler):
+            getattr(self, old_handler)(stmt)
+            return
+
+        self.l.warning('Unsupported statement type %s.', type(stmt).__name__)
 
     def _ail_handle_Jump(self, stmt):
         raise NotImplementedError('Please implement the Jump handler with your own logic.')

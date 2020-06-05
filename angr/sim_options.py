@@ -7,10 +7,6 @@ from .sim_state_options import SimStateOptions
 # This option controls whether or not constraints are tracked in the analysis.
 TRACK_CONSTRAINTS = "TRACK_CONSTRAINTS"
 
-# This option causes constraints to be flushed at the beginning of every instruction.
-INSTRUCTION_SCOPE_CONSTRAINTS = "INSTRUCTION_SCOPE_CONSTRAINTS"
-BLOCK_SCOPE_CONSTRAINTS = "BLOCK_SCOPE_CONSTRAINTS"
-
 # This option controls whether or not various entities (IRExpr constants, reads, writes, etc) get simplified automatically
 SIMPLIFY_EXPRS = "SIMPLIFY_EXPRS"
 SIMPLIFY_MEMORY_READS = "SIMPLIFY_MEMORY_READS"
@@ -208,6 +204,7 @@ CACHELESS_SOLVER = "CACHELESS_SOLVER"
 
 # IR optimization
 OPTIMIZE_IR = "OPTIMIZE_IR"
+NO_CROSS_INSN_OPT = "NO_CROSS_INSN_OPT"
 
 SPECIAL_MEMORY_FILL = "SPECIAL_MEMORY_FILL"
 
@@ -304,6 +301,13 @@ SYMBION_SYNC_CLE = "SYMBION_SYNC_CLE"
 # We will execute SimProc for functions for which we have one, and the real function for the one we have not.
 SYMBION_KEEP_STUBS_ON_SYNC = "SYMBION_KEEP_STUBS_ON_SYNC"
 
+# Activate the heuristic that tries to understand if an unknown method (e. g. library call) gets or sets an
+# attribute inside the object. Turn on this option to have a better approximation of the internal structure of the
+# symbolic object.
+JAVA_IDENTIFY_GETTER_SETTER = "JAVA_IDENTIFY_GETTER_SETTER"
+# Activate attributes tracking for objects.
+JAVA_TRACK_ATTRIBUTES = "JAVA_TRACK_ATTRIBUTES"
+
 #
 # Register those variables as Boolean state options
 #
@@ -333,7 +337,7 @@ concrete = { SYNC_CLE_BACKEND_CONCRETE }
 modes = {
     'symbolic': common_options | symbolic | { TRACK_CONSTRAINT_ACTIONS }, #| approximation | { VALIDATE_APPROXIMATIONS }
     'symbolic_approximating': common_options | symbolic | approximation | { TRACK_CONSTRAINT_ACTIONS },
-    'static': (common_options - simplification) | { REGION_MAPPING, BEST_EFFORT_MEMORY_STORING, SYMBOLIC_INITIAL_VALUES, DO_CCALLS, DO_RET_EMULATION, TRUE_RET_EMULATION_GUARD, BLOCK_SCOPE_CONSTRAINTS, TRACK_CONSTRAINTS, ABSTRACT_MEMORY, ABSTRACT_SOLVER, USE_SIMPLIFIED_CCALLS, REVERSE_MEMORY_NAME_MAP },
+    'static': (common_options - simplification) | { REGION_MAPPING, BEST_EFFORT_MEMORY_STORING, SYMBOLIC_INITIAL_VALUES, DO_CCALLS, DO_RET_EMULATION, TRUE_RET_EMULATION_GUARD, TRACK_CONSTRAINTS, ABSTRACT_MEMORY, ABSTRACT_SOLVER, USE_SIMPLIFIED_CCALLS, REVERSE_MEMORY_NAME_MAP },
     'fastpath': (common_options - simplification ) | (symbolic - { SYMBOLIC, DO_CCALLS }) | resilience | { TRACK_OP_ACTIONS, BEST_EFFORT_MEMORY_STORING, AVOID_MULTIVALUED_READS, AVOID_MULTIVALUED_WRITES, SYMBOLIC_INITIAL_VALUES, DO_RET_EMULATION, NO_SYMBOLIC_JUMP_RESOLUTION, NO_SYMBOLIC_SYSCALL_RESOLUTION, FAST_REGISTERS },
     'tracing': (common_options - simplification - {SUPPORT_FLOATING_POINT, ALL_FILES_EXIST}) | symbolic | resilience | (unicorn - { UNICORN_TRACK_STACK_POINTERS }) | { CGC_NO_SYMBOLIC_RECEIVE_LENGTH, REPLACEMENT_SOLVER, EXCEPTION_HANDLING, ZERO_FILL_UNCONSTRAINED_MEMORY, PRODUCE_ZERODIV_SUCCESSORS, ALLOW_SEND_FAILURES, SYMBOLIC_MEMORY_NO_SINGLEVALUE_OPTIMIZATIONS, MEMORY_FIND_STRICT_SIZE_LIMIT },
 }

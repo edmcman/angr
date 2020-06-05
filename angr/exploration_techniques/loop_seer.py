@@ -15,7 +15,9 @@ class LoopSeer(ExplorationTechnique):
     free to add something else).
     """
 
-    def __init__(self, cfg=None, functions=None, loops=None, use_header=False, bound=None, bound_reached=None, discard_stash='spinning'):
+    def __init__(self, cfg=None, functions=None, loops=None, use_header=False,
+                 bound=None, bound_reached=None, discard_stash='spinning',
+                 limit_concrete_loops=True):
         """
         :param cfg:             Normalized CFG is required.
         :param functions:       Function(s) containing the loop(s) to be analyzed.
@@ -26,6 +28,8 @@ class LoopSeer(ExplorationTechnique):
                                 a SimulationManager. Will be called when loop execution reach the given bound.
                                 Default to moving states that exceed the loop limit to a discard stash.
         :param discard_stash:   Name of the stash containing states exceeding the loop limit.
+        :param limit_concrete_loops: If False, do not limit a loop back-edge if it is the only successor
+                                (Defaults to True to maintain the original behavior)
         """
 
         super(LoopSeer, self).__init__()
@@ -35,8 +39,9 @@ class LoopSeer(ExplorationTechnique):
         self.bound_reached = bound_reached
         self.discard_stash = discard_stash
         self.use_header = use_header
-
+        self.limit_concrete_loops = limit_concrete_loops
         self.loops = {}
+        self.cut_succs = []
         if type(loops) is Loop:
             loops = [loops]
 
@@ -79,31 +84,63 @@ class LoopSeer(ExplorationTechnique):
                     entry = loop.entry_edges[0][0]
                     self.loops[entry.addr] = loop
 
-    def step(self, simgr, stash='active', **kwargs):
-        for state in simgr.stashes[stash]:
+    def filter(self, simgr, state, **kwargs):
+        if state in self.cut_succs:
+            self.cut_succs.remove(state)
+            return self.discard_stash
+        else:
+            return simgr.filter(state, **kwargs)
+
+    def successors(self, simgr, state, **kwargs):
+        node = self.cfg.model.get_any_node(state.addr)
+        if node is not None:
+            kwargs['num_inst'] = min(kwargs.get('num_inst', float('inf')), len(node.instruction_addrs))
+        succs = simgr.successors(state, **kwargs)
+
+
+        # Edge case: When limiting concrete loops, we may not want to do so
+        # via the header.  If there is a way out of the loop, and we can
+        # chose not to take it (e.g., the loop is not concrete), increase the trip count
+        at_loop_exit = False
+        for succ_state in succs.successors:
+            if succ_state.loop_data.current_loop:
+                if succ_state.addr in succ_state.loop_data.current_loop[-1][1]:
+                    at_loop_exit = True
+        for succ_state in succs.successors:
             # Processing a currently running loop
-            if state.loop_data.current_loop:
-                loop = state.loop_data.current_loop[-1][0]
+            if succ_state.loop_data.current_loop:
+                loop = succ_state.loop_data.current_loop[-1][0]
                 header = loop.entry.addr
-
-                if state.addr == header:
+                if succ_state.addr == header:
                     continue_addrs = [e[0].addr for e in loop.continue_edges]
-                    if state.history.addr in continue_addrs:
-                        state.loop_data.back_edge_trip_counts[state.addr][-1] += 1
-                    state.loop_data.header_trip_counts[state.addr][-1] += 1
-
-                elif state.addr in state.loop_data.current_loop[-1][1]:
-                    state.loop_data.current_loop.pop()
-
-                if self.bound is not None:
-                    counts = state.loop_data.back_edge_trip_counts[header][-1] if not self.use_header else \
-                             state.loop_data.header_trip_counts[header][-1]
+                    # If there's only one successor, the loop is "concrete"
+                    # We may wish not to cut loops that are concrete, as this can dead-end
+                    # the path prematurely, even when there won't be state explosion.
+                    if self.limit_concrete_loops or len(succs.successors) > 1:
+                        if succ_state.history.addr in continue_addrs:
+                            succ_state.loop_data.back_edge_trip_counts[succ_state.addr][-1] += 1
+                        succ_state.loop_data.header_trip_counts[succ_state.addr][-1] += 1
+                elif succ_state.addr in succ_state.loop_data.current_loop[-1][1]:
+                    succ_state.loop_data.current_loop.pop()
+                elif at_loop_exit and self.limit_concrete_loops:
+                    # We're not at the header, but we're where we exit the loop
+                    # NOTE: this only matters if you want to not limit concrete loops
+                    if not self.limit_concrete_loops and len(succs.successors) > 1:
+                        succ_state.loop_data.back_edge_trip_counts[succ_state.addr][-1] += 1
+                if self.bound is not None and succ_state.loop_data.current_loop:
+                    counts = 0
+                    if self.use_header:
+                        counts = succ_state.loop_data.header_trip_counts[header][-1]
+                    else:
+                        if succ_state.addr in succ_state.loop_data.back_edge_trip_counts:
+                            counts = succ_state.loop_data.back_edge_trip_counts[succ_state.addr][-1]
                     if counts > self.bound:
                         if self.bound_reached is not None:
                             simgr = self.bound_reached(simgr)
                         else:
-                            simgr.stashes[stash].remove(state)
-                            simgr.stashes[self.discard_stash].append(state)
+                            # Remove the state from the successors object
+                            self.cut_succs.append(succ_state)
+
 
                 l.debug("%s back edge based trip counts %s", state, state.loop_data.back_edge_trip_counts)
                 l.debug("%s header based trip counts %s", state, state.loop_data.header_trip_counts)
@@ -111,25 +148,20 @@ class LoopSeer(ExplorationTechnique):
             # Loop entry detected. This test is put here because in case of
             # nested loops, we want to handle the outer loop before proceeding
             # the inner loop.
-            if state.addr in self.loops:
-                loop = self.loops[state.addr]
+            if succ_state.addr in self.loops:
+                loop = self.loops[succ_state.addr]
                 header = loop.entry.addr
                 exits = [e[1].addr for e in loop.break_edges]
 
-                state.loop_data.back_edge_trip_counts[header].append(0)
-                state.loop_data.header_trip_counts[header].append(0)
-                state.loop_data.current_loop.append((loop, exits))
-
-        simgr.step(stash=stash, **kwargs)
-
-        return simgr
-
-    def successors(self, simgr, state, **kwargs):
-        node = self.cfg.model.get_any_node(state.addr)
-        if node is not None:
-            kwargs['num_inst'] = min(kwargs.get('num_inst', float('inf')), len(node.instruction_addrs))
-        return simgr.successors(state, **kwargs)
-
+                succ_state.loop_data.back_edge_trip_counts[header].append(0)
+                # If we are not limiting concrete loops, we also consider
+                # trip counts at the possible exits
+                if not self.limit_concrete_loops:
+                    for node in loop.body_nodes:
+                        succ_state.loop_data.back_edge_trip_counts[node.addr].append(0)
+                succ_state.loop_data.header_trip_counts[header].append(0)
+                succ_state.loop_data.current_loop.append((loop, exits))
+        return succs
     def _get_function(self, func):
         f = None
         if type(func) is str:

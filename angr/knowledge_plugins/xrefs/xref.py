@@ -1,7 +1,8 @@
+from typing import Optional
 
-from .xref_types import XRefType
 from ...serializable import Serializable
 from ...protos import primitives_pb2
+from .xref_types import XRefType
 
 
 class XRef(Serializable):
@@ -11,8 +12,12 @@ class XRef(Serializable):
 
     __slots__ = ('ins_addr', 'block_addr', 'stmt_idx', 'insn_op_idx', 'insn_op_type', 'memory_data', 'dst', 'type', )
 
-    def __init__(self, ins_addr=None, block_addr=None, stmt_idx=None, insn_op_idx=None, memory_data=None, dst=None,
+    def __init__(self, ins_addr=None, block_addr=None, stmt_idx=None, insn_op_idx=None, memory_data=None,
+                 dst: Optional[int]=None,
                  xref_type=None):
+
+        if dst is not None and not isinstance(dst, int):
+            raise TypeError("XRefs must be pointing to a constant target. Target %r is not supported." % dst)
 
         # src
         self.ins_addr = ins_addr
@@ -54,14 +59,26 @@ class XRef(Serializable):
 
     def serialize_to_cmessage(self):
         # pylint:disable=no-member
+
+        # delayed import
+        from ...engines.light import SpOffset  # pylint:disable=import-outside-toplevel
+
         cmsg = self._get_cmsg()
         if self.memory_data is not None:
-            cmsg.target_type = primitives_pb2.CodeReference.CodeTarget \
-                if self.memory_data.sort == MemoryDataSort.CodeReference else primitives_pb2.CodeReference.DataTarget
+            # determine target_type from memory_data.sort
+            if self.memory_data.sort == MemoryDataSort.CodeReference:
+                cmsg.target_type = primitives_pb2.CodeReference.CodeTarget
+            else:
+                cmsg.target_type = primitives_pb2.CodeReference.DataTarget
+
             cmsg.location = primitives_pb2.CodeReference.Internal
             cmsg.data_ea = self.memory_data.addr
         elif self.dst is not None:
-            cmsg.data_ea = self.dst
+            if isinstance(self.dst, SpOffset):
+                cmsg.target_type = primitives_pb2.CodeReference.StackTarget
+                cmsg.data_ea = self.dst.offset
+            else:
+                cmsg.data_ea = self.dst
         else:
             # Unknown... why?
             cmsg.data_ea = -1
@@ -76,11 +93,23 @@ class XRef(Serializable):
         return cmsg
 
     @classmethod
-    def parse_from_cmessage(cls, cmsg, **kwargs):
+    def parse_from_cmessage(cls, cmsg, bits=None, **kwargs):  # pylint:disable=arguments-differ
         # Note that we cannot recover _memory_data from cmsg
+
+        # delayed import
+        from ...engines.light import SpOffset  # pylint:disable=import-outside-toplevel
+
+        if not isinstance(bits, int):
+            raise TypeError("bits must be provided.")
+
+        if cmsg.target_type == primitives_pb2.CodeReference.StackTarget:  # pylint:disable=no-member
+            dst = SpOffset(bits, cmsg.data_ea, is_base=False)
+        else:
+            dst = cmsg.data_ea
+
         cr = XRef(ins_addr=cmsg.ea, block_addr=cmsg.block_ea, stmt_idx=cmsg.stmt_idx,
                   insn_op_idx=None if cmsg.operand_idx == -1 else cmsg.opearnd_idx,
-                  dst=cmsg.data_ea, xref_type=cmsg.ref_type)
+                  dst=dst, xref_type=cmsg.ref_type)
         return cr
 
     def copy(self):

@@ -1,3 +1,5 @@
+from typing import Dict, Optional
+
 import claripy
 import logging
 from archinfo.arch_arm import is_arm_arch
@@ -35,9 +37,17 @@ def boolean_extend(O, a, b, size):
 def op_concretize(op):
     if type(op) is int:
         return op
+    op = op.ite_excavated
+    if op.op == 'If':
+        cases = list(claripy.reverse_ite_cases(op))
+        if all(c.op == 'BVV' for _, c in cases):
+            raise CCallMultivaluedException(cases)
     if op.op != 'BVV':
         raise SimError("Hit a symbolic conditional operation. Something has gone wildly wrong.")
     return op.args[0]
+
+class CCallMultivaluedException(Exception):
+    pass
 
 ##################
 ### x86* data ###
@@ -55,7 +65,7 @@ data = {
         'CondBitMasks': { },
         'OpTypes': { },
     }
-}
+} # type: Dict[str, Dict[str, Dict[str, Optional[int]]]]
 
 # condition types
 data['AMD64']['CondTypes']['CondO']      = 0  # /* overflow           */
@@ -1484,8 +1494,10 @@ def armg_calculate_flags_nzcv(state, cc_op, cc_dep1, cc_dep2, cc_dep3):
 
 
 def armg_calculate_condition(state, cond_n_op, cc_dep1, cc_dep2, cc_dep3):
-    cond = claripy.LShR(cond_n_op, 4)
-    cc_op = cond_n_op & 0xF
+    concrete_cond_n_op = op_concretize(cond_n_op)
+
+    cond = concrete_cond_n_op >> 4
+    cc_op = concrete_cond_n_op & 0xF
     inv = cond & 1
 
     concrete_cond = op_concretize(cond)
@@ -1602,7 +1614,10 @@ def arm64g_calculate_flag_n(state, cc_op, cc_dep1, cc_dep2, cc_dep3):
     elif concrete_op == ARM64G_CC_OP_LOGIC64:
         flag = claripy.LShR(cc_dep1, 63)
 
-    if flag is not None: return flag
+    if flag is not None:
+        if len(flag) == 32:
+            flag = flag.zero_extend(32)
+        return flag
     l.error("Unknown cc_op %s (arm64g_calculate_flag_n)", cc_op)
     raise SimCCallError("Unknown cc_op %s" % cc_op)
 
@@ -1652,7 +1667,10 @@ def arm64g_calculate_flag_z(state, cc_op, cc_dep1, cc_dep2, cc_dep3):
     elif concrete_op in (ARM64G_CC_OP_LOGIC32, ARM64G_CC_OP_LOGIC64):
         flag = arm64_zerobit(state, cc_dep1)
 
-    if flag is not None: return flag
+    if flag is not None:
+        if len(flag) == 32:
+            flag = flag.zero_extend(32)
+        return flag
 
     l.error("Unknown cc_op %s (arm64g_calculate_flag_z)", concrete_op)
     raise SimCCallError("Unknown cc_op %s" % concrete_op)
@@ -1756,11 +1774,12 @@ def arm64g_calculate_data_nzcv(state, cc_op, cc_dep1, cc_dep2, cc_dep3):
     return _concat_flags(ARM64G_NBITS, vec)
 
 def arm64g_calculate_condition(state, cond_n_op, cc_dep1, cc_dep2, cc_dep3):
-    cond = claripy.LShR(cond_n_op, 4)
-    cc_op = cond_n_op & 0xF
+    concretize_cond_n_op = op_concretize(cond_n_op)
+    cond = concretize_cond_n_op >> 4
+    cc_op = concretize_cond_n_op & 0xF
     inv = cond & 1
 
-    concrete_cond = op_concretize(cond)
+    concrete_cond = cond
     flag = None
 
     if concrete_cond in (ARM64CondAL, ARM64CondNV):

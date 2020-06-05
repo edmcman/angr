@@ -15,7 +15,10 @@ class CFGManager(KnowledgeBasePlugin):
     def __repr__(self):
         return "<CFGManager with %d CFGs>" % len(self.cfgs)
 
-    def __getitem__(self, ident):
+    def __contains__(self, ident):
+        return ident in self.cfgs
+
+    def __getitem__(self, ident) -> CFGModel:
         if ident not in self.cfgs:
             self.cfgs[ident] = CFGModel(ident, cfg_manager=self)
         return self.cfgs[ident]
@@ -39,7 +42,10 @@ class CFGManager(KnowledgeBasePlugin):
 
     def copy(self):
         cm = CFGManager(self._kb)
-        cm.cfgs = self.cfgs.copy()
+        cm.cfgs = dict(map(
+            lambda x: (x[0], x[1].copy()),
+            self.cfgs.items()
+        ))
         return cm
 
     #

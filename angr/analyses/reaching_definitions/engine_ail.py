@@ -1,14 +1,18 @@
+from typing import Iterable, Union
 import logging
 
 import ailment
 
-from .atoms import Register, Tmp, MemoryLocation
-from .constants import OP_BEFORE, OP_AFTER
-from .dataset import DataSet
-from .external_codeloc import ExternalCodeLocation
-from .undefined import Undefined, undefined
 from ...engines.light import SimEngineLight, SimEngineLightAILMixin, RegisterOffset, SpOffset
 from ...errors import SimEngineError
+from ...calling_conventions import DEFAULT_CC, SimRegArg, SimStackArg
+from ...knowledge_plugins.key_definitions.atoms import Register, Tmp, MemoryLocation
+from ...knowledge_plugins.key_definitions.constants import OP_BEFORE, OP_AFTER
+from ...knowledge_plugins.key_definitions.dataset import DataSet
+from ...knowledge_plugins.key_definitions.undefined import Undefined, undefined
+from ...knowledge_plugins.key_definitions.live_definitions import Definition
+from .external_codeloc import ExternalCodeLocation
+from .rd_state import ReachingDefinitionsState
 
 l = logging.getLogger(name=__name__)
 
@@ -24,6 +28,8 @@ class SimEngineRDAIL(
         self._maximum_local_call_depth = maximum_local_call_depth
         self._function_handler = function_handler
         self._visited_blocks = None
+
+        self.state: ReachingDefinitionsState
 
     def process(self, state, *args, **kwargs):
         self._visited_blocks = kwargs.pop('visited_blocks', None)
@@ -59,12 +65,12 @@ class SimEngineRDAIL(
     # AIL statement handlers
     #
 
-    def _ail_handle_Stmt(self, stmt):
+    def _handle_Stmt(self, stmt):
 
         if self.state.analysis:
             self.state.analysis.insn_observe(self.ins_addr, stmt, self.block, self.state, OP_BEFORE)
 
-        super(SimEngineRDAIL, self)._ail_handle_Stmt(stmt)
+        super(SimEngineRDAIL, self)._handle_Stmt(stmt)
 
         if self.state.analysis:
             self.state.analysis.insn_observe(self.ins_addr, stmt, self.block, self.state, OP_AFTER)
@@ -82,12 +88,12 @@ class SimEngineRDAIL(
         if src is None:
             src = DataSet(undefined, dst.bits)
 
-        if type(dst) is ailment.Tmp:
-            self.state.kill_and_add_definition(Tmp(dst.tmp_idx), self._codeloc(), src)
+        if isinstance(dst, ailment.Tmp):
+            self.state.kill_and_add_definition(Tmp(dst.tmp_idx, dst.size), self._codeloc(), src)
             self.tmps[dst.tmp_idx] = src
 
-        elif type(dst) is ailment.Register:
-            reg = Register(dst.reg_offset, dst.bits // 8)
+        elif isinstance(dst, ailment.Register):
+            reg = Register(dst.reg_offset, dst.size)
             self.state.kill_and_add_definition(reg, self._codeloc(), src)
 
             if dst.reg_offset == self.arch.sp_offset:
@@ -97,34 +103,33 @@ class SimEngineRDAIL(
         else:
             l.warning('Unsupported type of Assignment dst %s.', type(dst).__name__)
 
-    def _ail_handle_Store(self, stmt):
-        data = self._expr(stmt.data)
-        addr = self._expr(stmt.addr)
-        size = stmt.size
+    def _ail_handle_Store(self, stmt: ailment.Stmt.Store):
+        data: DataSet = self._expr(stmt.data)
+        addr: Iterable[Union[int,SpOffset,Undefined]] = self._expr(stmt.addr)
+        size: int = stmt.size
+        if stmt.guard is not None:
+            guard = self._expr(stmt.guard)  # pylint:disable=unused-variable
+        else:
+            guard = None  # pylint:disable=unused-variable
 
         for a in addr:
             if type(a) is Undefined:
                 l.info('Memory address undefined, ins_addr = %#x.', self.ins_addr)
-            else:
-                if any(type(d) is Undefined for d in data):
-                    l.info('Data to write at address %s undefined, ins_addr = %#x.',
-                           hex(a) if type(a) is int else a, self.ins_addr
-                           )
+                continue
 
-                if type(a) is SpOffset:
-                    # Writing to stack
-                    memloc = a
-                else:
-                    # Writing to a non-stack memory region
-                    memloc = MemoryLocation(a, size)
+            if any(type(d) is Undefined for d in data):
+                l.info('Data to write at address %s undefined, ins_addr = %#x.',
+                       hex(a) if type(a) is int else a, self.ins_addr
+                       )
 
-                if not memloc.symbolic:
-                    # different addresses are not killed by a subsequent iteration, because kill only removes entries
-                    # with same index and same size
-                    self.state.kill_and_add_definition(memloc, self._codeloc(), data)
+            memory_location = MemoryLocation(a, size)
+            if not memory_location.symbolic:
+                # different addresses are not killed by a subsequent iteration, because kill only removes entries
+                # with same index and same size
+                self.state.kill_and_add_definition(memory_location, self._codeloc(), data)
 
     def _ail_handle_Jump(self, stmt):
-        target = self._expr(stmt.target)  # pylint:disable=unused-variable
+        _ = self._expr(stmt.target)
 
     def _ail_handle_ConditionalJump(self, stmt):
 
@@ -148,15 +153,22 @@ class SimEngineRDAIL(
         ip = Register(self.arch.ip_offset, self.arch.bytes)
         self.state.kill_definitions(ip, self._codeloc())
 
-        # if arguments exist, use them
-        if stmt.args:
-            for arg in stmt.args:
-                self._expr(arg)
-
         # When stmt.args are available, used registers/stack variables are decided by stmt.args. Otherwise we fall-back
-        # to using all caller-saved registers.
+        # to using all argument registers.
         if stmt.args is not None:
+            # getting used expressions from stmt.args
             used_exprs = stmt.args
+        elif stmt.calling_convention is not None and (
+                stmt.calling_convention.func_ty is not None or stmt.calling_convention.args is not None):
+            # getting used expressions from the function prototype, its arguments, and the calling convention
+            used_exprs = [ ]
+            for arg_loc in stmt.calling_convention.arg_locs():
+                if isinstance(arg_loc, SimRegArg):
+                    used_exprs.append(Register(self.arch.registers[arg_loc.reg_name], arg_loc.size))
+                elif isinstance(arg_loc, SimStackArg):
+                    used_exprs.append(SpOffset(arg_loc.size * 8, arg_loc.stack_offset, is_base=False))
+                else:
+                    l.warning("_handle_Call(): Unsupported arg_loc %r.", arg_loc)
         else:
             used_exprs = None
 
@@ -173,7 +185,7 @@ class SimEngineRDAIL(
 
         # Add uses
         if used_exprs is None:
-            used_exprs = [ var for var in killed_vars if var.reg_offset != return_reg_offset ]
+            used_exprs = [ Register(*self.arch.registers[reg_name]) for reg_name in cc.ARG_REGS ]
         for expr in used_exprs:
             self._expr(expr)
 
@@ -193,13 +205,52 @@ class SimEngineRDAIL(
             self.state.kill_definitions(Register(*self.arch.registers['cc_dep2']), self._codeloc())
             self.state.kill_definitions(Register(*self.arch.registers['cc_ndep']), self._codeloc())
 
+    def _ail_handle_Return(self, stmt):  # pylint:disable=unused-argument
+        # consume registers that are potentially useful
+        # TODO: Consider the calling convention of the current function
+
+        cc_cls = DEFAULT_CC.get(self.project.arch.name, None)
+        if cc_cls is None:
+            l.warning("Unknown default calling convention for architecture %s.", self.project.arch.name)
+            return
+
+        cc = cc_cls(self.project.arch)
+        codeloc = self._codeloc()
+        size = self.project.arch.bits // 8
+        # return value
+        if cc.RETURN_VAL is not None:
+            if isinstance(cc.RETURN_VAL, SimRegArg):
+                offset = cc.RETURN_VAL._fix_offset(None, size, arch=self.project.arch)
+                self.state.add_use(Register(offset, size), codeloc)
+        # base pointer
+        # TODO: Check if the stack base pointer is used as a stack base pointer in this function or not
+        self.state.add_use(Register(self.project.arch.bp_offset, self.project.arch.bits // 8), codeloc)
+        # We don't add sp since stack pointers are supposed to be get rid of in AIL. this is definitely a hack though
+        # self.state.add_use(Register(self.project.arch.sp_offset, self.project.arch.bits // 8), codeloc)
+
+    def _ail_handle_DirtyStatement(self, stmt: ailment.Stmt.DirtyStatement):
+        # TODO: The logic below is subject to change when ailment.Stmt.DirtyStatement is changed
+        tmp = stmt.dirty_stmt.dst
+        cvt_sizes = {
+            'ILGop_IdentV128': 16,
+            'ILGop_Ident64': 8,
+            'ILGop_Ident32': 4,
+            'ILGop_16Uto32': 4,
+            'ILGop_16Sto32': 4,
+            'ILGop_8Uto32': 4,
+            'ILGop_8Sto32': 4,
+        }
+        size = cvt_sizes[stmt.dirty_stmt.cvt]
+        self.state.kill_and_add_definition(Tmp(tmp, size), self._codeloc(), None)
+        self.tmps[tmp] = None
+
     #
     # AIL expression handlers
     #
 
-    def _ail_handle_Tmp(self, expr):
+    def _ail_handle_Tmp(self, expr: ailment.Expr.Tmp):
 
-        self.state.add_use(Tmp(expr.tmp_idx), self._codeloc())
+        self.state.add_use(Tmp(expr.tmp_idx, expr.size), self._codeloc())
 
         return super(SimEngineRDAIL, self)._ail_handle_Tmp(expr)
 
@@ -210,14 +261,10 @@ class SimEngineRDAIL(
         bits = size * 8
 
         # first check if it is ever defined
-        defs = self.state.register_definitions.get_objects_by_offset(reg_offset)
+        defs: Iterable[Definition] = self.state.register_definitions.get_objects_by_offset(reg_offset)
         if not defs:
             # define it right away as an external dependency
-            self.state.kill_and_add_definition(Register(reg_offset, size), self._external_codeloc(),
-                                               data=expr
-                                               )
-            # defs = self.state.register_definitions.get_objects_by_offset(reg_offset)
-            # assert defs
+            self.state.kill_and_add_definition(Register(reg_offset, size), self._external_codeloc(), None)
 
         self.state.add_use(Register(reg_offset, size), self._codeloc())
 
@@ -247,12 +294,16 @@ class SimEngineRDAIL(
         except KeyError:
             return DataSet(RegisterOffset(bits, reg_offset, 0), bits)
 
-    def _ail_handle_Load(self, expr):
-
+    def _ail_handle_Load(self, expr: ailment.Expr.Load):
         addrs = self._expr(expr.addr)
         size = expr.size
         bits = expr.bits
-        codeloc = self._codeloc()
+        if expr.guard is not None:
+            guard = self._expr(expr.guard)  # pylint:disable=unused-variable
+            alt = self._expr(expr.alt)  # pylint:disable=unused-variable
+        else:
+            guard = None  # pylint:disable=unused-variable
+            alt = None  # pylint:disable=unused-variable
 
         data = set()
         for addr in addrs:
@@ -260,7 +311,6 @@ class SimEngineRDAIL(
                 current_defs = self.state.memory_definitions.get_objects_by_offset(addr)
                 if current_defs:
                     for current_def in current_defs:
-                        # self.state.add_use(current_def, codeloc)
                         data.update(current_def.data)
                     if any(type(d) is Undefined for d in data):
                         l.info('Memory at address %#x undefined, ins_addr = %#x.', addr, self.ins_addr)
@@ -271,8 +321,9 @@ class SimEngineRDAIL(
                         pass
 
                 # FIXME: _add_memory_use() iterates over the same loop
-                self.state.add_use(MemoryLocation(addr, size), codeloc)
-            elif isinstance(addr, SpOffset):
+                memory_location = MemoryLocation(addr, size)
+                self.state.add_use(memory_location, self._codeloc())
+            elif isinstance(addr, SpOffset) and isinstance(addr.offset, int):
                 current_defs = self.state.stack_definitions.get_objects_by_offset(addr.offset)
                 if current_defs:
                     for current_def in current_defs:
@@ -283,9 +334,9 @@ class SimEngineRDAIL(
                 else:
                     data.add(undefined)
 
-                self.state.add_use(addr, codeloc)
+                self.state.add_use(MemoryLocation(addr, size), self._codeloc())
             else:
-                l.info('Memory address undefined, ins_addr = %#x.', self.ins_addr)
+                l.debug('Memory address %r undefined or unsupported at pc %#x.', addr, self.ins_addr)
 
         if len(data) == 0:
             data.add(undefined)
@@ -331,17 +382,20 @@ class SimEngineRDAIL(
                 r = DataSet(converted, expr.to_bits)
 
         if r is None:
-            r = ailment.Expr.Convert(expr.idx, expr.from_bits, expr.to_bits, expr.is_signed,
-                                     to_conv)
-            r = DataSet(r, expr.to_bits)
+            r = DataSet(undefined, expr.to_bits)
 
         return r
+
+    def _ail_handle_ITE(self, expr: ailment.Expr.ITE):
+        cond = self._expr(expr.cond)
+        iftrue = self._expr(expr.iftrue)
+        iffalse = self._expr(expr.iffalse)
+        return ailment.Expr.ITE(expr.idx, cond, iffalse, iftrue)
 
     def _ail_handle_BinaryOp(self, expr):
         r = super()._ail_handle_BinaryOp(expr)
         if isinstance(r, ailment.Expr.BinaryOp):
-            # Repack it with DataSet
-            return DataSet({r}, r.bits)
+            return DataSet(undefined, r.bits)
         return r
 
     def _ail_handle_Cmp(self, expr):
@@ -372,10 +426,10 @@ class SimEngineRDAIL(
                        )
 
     def _ail_handle_DirtyExpression(self, expr):  # pylint:disable=no-self-use
-        return expr
+        return DataSet(undefined, expr.bits // 8)
 
     #
-    # User defined high level statement handlers
+    # User defined high-level statement handlers
     #
 
     def _handle_function(self):

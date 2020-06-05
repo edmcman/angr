@@ -1,6 +1,6 @@
 # pylint: disable=wildcard-import
 
-__version__ = (8, 20, 1, 7)
+__version__ = (8, 20, 6, 1)
 
 if bytes is str:
     raise Exception("""
@@ -61,6 +61,7 @@ from .calling_conventions import DEFAULT_CC, SYSCALL_CC, PointerWrapper, SimCC
 from .storage.file import SimFileBase, SimFile, SimPackets, SimFileStream, SimPacketsStream, SimFileDescriptor, SimFileDescriptorDuplex
 from .state_plugins.filesystem import SimMount, SimHostFilesystem
 from .state_plugins.heap import SimHeapBrk, SimHeapPTMalloc, PTChunk
+from .distributed import Server
 
 # for compatibility reasons
 from . import sim_manager as manager

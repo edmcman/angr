@@ -9,6 +9,7 @@ message CodeReference {
     enum TargetType {
         CodeTarget = 0;
         DataTarget = 1;
+        StackTarget = 2;
     }
 
     enum OperandType {
@@ -106,6 +107,7 @@ message Edge {
         MapFail = 13;
         NoRedir = 14;
         ClientReq = 15;
+        Exception = 16;
     }
 
     int64               src_ea = 1; // Address of the source block

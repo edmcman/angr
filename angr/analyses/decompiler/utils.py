@@ -1,7 +1,8 @@
+from typing import Optional, Tuple, Any
 
 import ailment
 
-from .structurer_nodes import MultiNode, BaseNode, CodeNode, SequenceNode
+from .structurer_nodes import MultiNode, BaseNode, CodeNode, SequenceNode, ConditionNode, SwitchCaseNode
 
 
 def remove_last_statement(node):
@@ -52,6 +53,33 @@ def append_statement(node, stmt):
     raise NotImplementedError()
 
 
+def replace_last_statement(node, old_stmt, new_stmt):
+
+    if type(node) is CodeNode:
+        replace_last_statement(node.node, old_stmt, new_stmt)
+        return
+    if type(node) is ailment.Block:
+        if node.statements[-1] is old_stmt:
+            node.statements[-1] = new_stmt
+        return
+    if type(node) is MultiNode:
+        if node.nodes:
+            replace_last_statement(node.nodes[-1], old_stmt, new_stmt)
+        return
+    if type(node) is SequenceNode:
+        if node.nodes:
+            replace_last_statement(node.nodes[-1], old_stmt, new_stmt)
+        return
+    if type(node) is ConditionNode:
+        if node.true_node is not None:
+            replace_last_statement(node.true_node, old_stmt, new_stmt)
+        if node.false_node is not None:
+            replace_last_statement(node.false_node, old_stmt, new_stmt)
+        return
+
+    raise NotImplementedError()
+
+
 def extract_jump_targets(stmt):
     """
     Extract concrete goto targets from a Jump or a ConditionalJump statement.
@@ -75,13 +103,12 @@ def extract_jump_targets(stmt):
     return targets
 
 
-def switch_extract_cmp_bounds(last_stmt):
+def switch_extract_cmp_bounds(last_stmt: ailment.Stmt.ConditionalJump) -> Optional[Tuple[Any,int,int]]:
     """
     Check the last statement of the switch-case header node, and extract lower+upper bounds for the comparison.
 
-    :param ailment.Stmt last_stmt:  The last statement of the switch-case header node.
-    :return:                        A tuple of (comparison expression, lower bound, upper bound), or None
-    :rtype:                         tuple|None
+    :param last_stmt:   The last statement of the switch-case header node.
+    :return:            A tuple of (comparison expression, lower bound, upper bound), or None
     """
 
     if not isinstance(last_stmt, ailment.Stmt.ConditionalJump):
@@ -130,15 +157,48 @@ def get_ast_subexprs(claripy_ast):
             yield ast
 
 
-def insert_node(parent, idx, node):
+def insert_node(parent, insert_idx, node, node_idx, label=None, insert_location=None):
 
     if isinstance(parent, SequenceNode):
-        parent.nodes.insert(idx, node)
+        parent.nodes.insert(insert_idx, node)
     elif isinstance(parent, CodeNode):
         # Make a new sequence node
         seq = SequenceNode(nodes=[parent.node, node])
         parent.node = seq
     elif isinstance(parent, MultiNode):
-        parent.nodes.insert(idx, node)
+        parent.nodes.insert(insert_idx, node)
+    elif isinstance(parent, ConditionNode):
+        if node_idx == 0:
+            # true node
+            parent.true_node = SequenceNode(nodes=[parent.true_node])
+            insert_node(parent.true_node, insert_idx - node_idx, node, 0)
+        else:
+            # false node
+            parent.false_node = SequenceNode(nodes=[parent.false_node])
+            insert_node(parent.false_node, insert_idx - node_idx, node, 0)
+    elif isinstance(parent, SwitchCaseNode):
+        # note that this case will be hit only when the parent node is not a container, such as SequenceNode or
+        # MultiNode. we always need to create a new SequenceNode and replace the original node in place.
+        if label == 'switch_expr':
+            raise TypeError("You cannot insert a node after an expression.")
+        if label == 'case':
+            # node_idx is the case number
+            if insert_location == 'after':
+                new_nodes = [ parent.cases[node_idx], node ]
+            elif insert_location == 'before':
+                new_nodes = [ node, parent.cases[node_idx] ]
+            else:
+                raise TypeError("Unsupported 'insert_location' value %r." % insert_location)
+            seq = SequenceNode(nodes=new_nodes)
+            parent.cases[node_idx] = seq
+        elif label == 'default':
+            if insert_location == 'after':
+                new_nodes = [ parent.default_node, node ]
+            elif insert_location == 'before':
+                new_nodes = [ node, parent.default_node ]
+            else:
+                raise TypeError("Unsupported 'insert_location' value %r." % insert_location)
+            seq = SequenceNode(nodes=new_nodes)
+            parent.default_node = seq
     else:
         raise NotImplementedError()

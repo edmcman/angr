@@ -129,10 +129,12 @@ if 'bdist_wheel' in sys.argv and '--plat-name' not in sys.argv:
         # https://www.python.org/dev/peps/pep-0425/
         sys.argv.append(name.replace('.', '_').replace('-', '_'))
 
+_UNICORN = "unicorn>=1.0.2rc2"
+
 setup(
     name='angr',
-    version='8.20.1.7',
-    python_requires='>=3.5',
+    version='8.20.6.1',
+    python_requires='>=3.6',
     description='A multi-architecture binary analysis toolkit, with the ability to perform dynamic symbolic execution and various static analyses on binaries',
     url='https://github.com/angr/angr',
     packages=packages,
@@ -146,22 +148,25 @@ setup(
         'progressbar2',
         'rpyc',
         'cffi>=1.7.0',
-        'unicorn>=1.0.2rc2',
-        'archinfo==8.20.1.7',
-        'claripy==8.20.1.7',
-        'cle==8.20.1.7',
-        'pyvex==8.20.1.7',
-        'ailment==8.20.1.7',
+        _UNICORN,
+        'archinfo==8.20.6.1',
+        'claripy==8.20.6.1',
+        'cle==8.20.6.1',
+        'pyvex==8.20.6.1',
+        'ailment==8.20.6.1',
         'GitPython',
         'psutil',
         'pycparser>=2.18',
         'itanium_demangler',
         'protobuf',
     ],
-    setup_requires=['unicorn', 'pyvex'],
+    setup_requires=[_UNICORN, 'pyvex'],
+    extras_require={
+        'AngrDB': ['sqlalchemy'],
+    },
     cmdclass=cmdclass,
     include_package_data=True,
     package_data={
-        'angr': ['lib/*']
+        'angr': ['lib/*', "py.typed"]
     }
 )

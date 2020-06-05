@@ -26,7 +26,7 @@ def ppc32g_dirtyhelper_MFSPR_287(state):
 
 def amd64g_dirtyhelper_RDTSC(state):
     if o.USE_SYSTEM_TIMES in state.options:
-        val = state.solver.BVV(int(time.clock() * 1000000) + 12345678, 64)
+        val = state.solver.BVV(int(time.process_time() * 1000000) + 12345678, 64)
     else:
         val = state.solver.BVS('RDTSC', 64, key=('hardware', 'rdtsc'))
     return val, []
@@ -337,6 +337,8 @@ def x86g_dirtyhelper_FINIT(state, gsptr): #pylint:disable=unused-argument
     state.regs.fc3210 = 0x0300
     state.regs.ftop = 0
     return None, [ ]
+
+amd64g_dirtyhelper_FINIT = x86g_dirtyhelper_FINIT
 
 def x86g_dirtyhelper_write_cr0(state, value):
     # make a deep copy of the arch before modifying it so we don't accidentally modify it for all other states

@@ -1,5 +1,6 @@
 import os
 import logging
+from collections import namedtuple
 
 from .plugin import SimStatePlugin
 from ..storage.file import SimFile
@@ -7,6 +8,11 @@ from ..errors import SimMergeError
 from ..misc.ux import once
 
 l = logging.getLogger(name=__name__)
+
+Stat = namedtuple('Stat', ('st_dev', 'st_ino', 'st_nlink', 'st_mode', 'st_uid',
+                           'st_gid', 'st_rdev', 'st_size', 'st_blksize',
+                           'st_blocks', 'st_atime', 'st_atimensec', 'st_mtime',
+                           'st_mtimensec', 'st_ctime', 'st_ctimensec'))
 
 class SimFilesystem(SimStatePlugin): # pretends links don't exist
     """
@@ -277,10 +283,9 @@ class SimConcreteFilesystem(SimMount):
         self.deleted_list = set()
 
     def get(self, path_elements):
-        path = self.pathsep.join(x.decode() for x in path_elements)
+        path = self._join_chunks([x.decode() for x in path_elements])
         if path in self.deleted_list:
             return None
-
         if path not in self.cache:
             simfile = self._load_file(path)
             if simfile is None:
@@ -292,8 +297,11 @@ class SimConcreteFilesystem(SimMount):
     def _load_file(self, guest_path):
         raise NotImplementedError
 
+    def _get_stat(self, guest_path):
+        raise NotImplementedError
+
     def insert(self, path_elements, simfile):
-        path = self.pathsep.join(x.decode() for x in path_elements)
+        path = self._join_chunks([x.decode() for x in path_elements])
         simfile.set_state(self.state)
         self.cache[path] = simfile
         self.deleted_list.discard(path)
@@ -350,6 +358,12 @@ class SimConcreteFilesystem(SimMount):
         if once('host_fs_widen_warning'):
             l.warning("The host filesystem mount can't be widened yet - beware unsoundness")
 
+    def _join_chunks(self, keys):
+        """
+        Takes a list of directories from the root and joins them into a string path
+        """
+        return self.pathsep + self.pathsep.join(keys)
+
 class SimHostFilesystem(SimConcreteFilesystem):
     """
     Simulated mount that makes some piece from the host filesystem available to the guest.
@@ -368,6 +382,7 @@ class SimHostFilesystem(SimConcreteFilesystem):
         return o
 
     def _load_file(self, guest_path):
+        guest_path = guest_path.lstrip(self.pathsep)
         path = os.path.join(self.host_path, guest_path)
         try:
             with open(path, 'rb') as fp:
@@ -377,6 +392,18 @@ class SimHostFilesystem(SimConcreteFilesystem):
         else:
             return SimFile(name='file://' + path, content=content, size=len(content))
 
+    def _get_stat(self, guest_path):
+        guest_path = guest_path.lstrip(self.pathsep)
+        path = os.path.join(self.host_path, guest_path)
+        try:
+            s = os.stat(path)
+            stat = Stat(s.st_dev, s.st_ino, s.st_nlink, s.st_mode, s.st_uid,
+                        s.st_gid, s.st_rdev, s.st_size, s.st_blksize, s.st_blocks,
+                        round(s.st_atime), s.st_atime_ns, round(s.st_mtime), s.st_mtime_ns,
+                        round(s.st_ctime), s.st_ctime_ns)
+            return stat
+        except OSError:
+            return None
 
 #class SimDirectory(SimStatePlugin):
 #    """

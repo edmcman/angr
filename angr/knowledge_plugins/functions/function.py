@@ -4,7 +4,7 @@ import networkx
 import string
 import itertools
 from collections import defaultdict
-from typing import Union, Optional
+from typing import Union, Optional, Iterable
 from typing import Type # For some reasons the linter doesn't recognize the use in apply_definition but PyCharm needs it imported to correctly recognize it # pylint: disable=unused-import
 
 from itanium_demangler import parse
@@ -13,7 +13,7 @@ from cle.backends.symbol import Symbol
 from archinfo.arch_arm import get_real_address_if_arm
 import claripy
 
-from ...codenode import BlockNode, HookNode, SyscallNode
+from ...codenode import CodeNode, BlockNode, HookNode, SyscallNode
 from ...serializable import Serializable
 from ...errors import AngrValueError, SimEngineError, SimMemoryError
 from ...procedures import SIM_LIBRARIES
@@ -388,13 +388,13 @@ class Function(Serializable):
         return FunctionParser.serialize(self)
 
     @classmethod
-    def parse_from_cmessage(cls, cmsg, function_manager=None):  # pylint:disable=arguments-differ
+    def parse_from_cmessage(cls, cmsg, **kwargs):
         """
         :param cmsg:
 
         :return Function: The function instantiated out of the cmsg data.
         """
-        return FunctionParser.parse_from_cmsg(cmsg, function_manager)
+        return FunctionParser.parse_from_cmsg(cmsg, **kwargs)
 
 
     def string_references(self, minimum_length=2, vex_only=False):
@@ -761,7 +761,7 @@ class Function(Serializable):
 
         self.transition_graph[src][dst]['confirmed'] = True
 
-    def _transit_to(self, from_node, to_node, outside=False, ins_addr=None, stmt_idx=None):
+    def _transit_to(self, from_node, to_node, outside=False, ins_addr=None, stmt_idx=None, is_exception=False):
         """
         Registers an edge between basic blocks in this function's transition graph.
         Arguments are CodeNode objects.
@@ -786,14 +786,15 @@ class Function(Serializable):
             else:
                 self._register_nodes(True, from_node)
 
+        type_ = 'transition' if not is_exception else 'exception'
         if to_node is not None:
-            self.transition_graph.add_edge(from_node, to_node, type='transition', outside=outside, ins_addr=ins_addr,
+            self.transition_graph.add_edge(from_node, to_node, type=type_, outside=outside, ins_addr=ins_addr,
                                            stmt_idx=stmt_idx
                                            )
 
         if outside:
             # this node is an endpoint of the current function
-            self._add_endpoint(from_node, 'transition')
+            self._add_endpoint(from_node, type_)
 
         # clear the cache
         self._local_transition_graph = None
@@ -846,7 +847,7 @@ class Function(Serializable):
         self._local_transition_graph = None
 
     def _return_from_call(self, from_func, to_node, to_outside=False):
-        self.transition_graph.add_edge(from_func, to_node, type='real_return', to_outside=to_outside)
+        self.transition_graph.add_edge(from_func, to_node, type='return', to_outside=to_outside)
         for _, _, data in self.transition_graph.in_edges(to_node, data=True):
             if 'type' in data and data['type'] == 'fake_return':
                 data['confirmed'] = True
@@ -859,6 +860,8 @@ class Function(Serializable):
 
         for node in nodes:
             self.transition_graph.add_node(node)
+            if not isinstance(node, CodeNode):
+                continue
             node._graph = self.transition_graph
             if node.addr not in self or self._block_sizes[node.addr] == 0:
                 self._block_sizes[node.addr] = node.size
@@ -972,11 +975,11 @@ class Function(Serializable):
                         self._callout_sites.add(the_node)
                         self._add_endpoint(the_node, 'call')
 
-    def get_call_sites(self):
+    def get_call_sites(self) -> Iterable[int]:
         """
         Gets a list of all the basic blocks that end in calls.
 
-        :return:                    A list of the addresses of the blocks that end in calls.
+        :return:                    A view of the addresses of the blocks that end in calls.
         """
         return self._call_sites.keys()
 
@@ -1007,7 +1010,14 @@ class Function(Serializable):
     @property
     def graph(self):
         """
-        :return networkx.DiGraph: A local transition graph that only contain nodes in current function.
+        Get a local transition graph. A local transition graph is a transition graph that only contains nodes that
+        belong to the current function. All edges, except for the edges going out from the current function or coming
+        from outside the current function, are included.
+
+        The generated graph is cached in self._local_transition_graph.
+
+        :return:    A local transition graph.
+        :rtype:     networkx.DiGraph
         """
 
         if self._local_transition_graph is not None:
@@ -1020,13 +1030,100 @@ class Function(Serializable):
             g.add_node(block)
         for src, dst, data in self.transition_graph.edges(data=True):
             if 'type' in data:
-                if data['type']  == 'transition' and ('outside' not in data or data['outside'] is False):
+                if data['type'] in ('transition', 'exception') and ('outside' not in data or data['outside'] is False):
                     g.add_edge(src, dst, **data)
                 elif data['type'] == 'fake_return' and 'confirmed' in data and \
                         ('outside' not in data or data['outside'] is False):
                     g.add_edge(src, dst, **data)
 
         self._local_transition_graph = g
+
+        return g
+
+    def graph_ex(self, exception_edges=True):
+        """
+        Get a local transition graph with a custom configuration. A local transition graph is a transition graph that
+        only contains nodes that belong to the current function. This method allows user to exclude certain types of
+        edges together with the nodes that are only reachable through such edges, such as exception edges.
+
+        The generated graph is not cached.
+
+        :param bool exception_edges:    Should exception edges and the nodes that are only reachable through exception
+                                        edges be kept.
+        :return:                        A local transition graph with a special configuration.
+        :rtype:                         networkx.DiGraph
+        """
+
+        # graph_ex() should not impact any already cached graph
+        old_cached_graph = self._local_transition_graph
+        graph = self.graph
+        self._local_transition_graph = old_cached_graph  # restore the cached graph
+
+        # fast path
+        if exception_edges:
+            return graph
+
+        # BFS on local graph but ignoring certain types of graphs
+        g = networkx.DiGraph()
+        queue = [ n for n in graph if n is self.startpoint or graph.in_degree[n] == 0 ]
+        traversed = set(queue)
+
+        while queue:
+            node = queue.pop(0)
+
+            g.add_node(node)
+            for _, dst, edge_data in graph.out_edges(node, data=True):
+                edge_type = edge_data.get('type', None)
+                if not exception_edges and edge_type == 'exception':
+                    # ignore this edge
+                    continue
+                g.add_edge(node, dst, **edge_data)
+
+                if dst not in traversed:
+                    traversed.add(dst)
+                    queue.append(dst)
+
+        return g
+
+    def transition_graph_ex(self, exception_edges=True):
+        """
+        Get a transition graph with a custom configuration. This method allows user to exclude certain types of edges
+        together with the nodes that are only reachable through such edges, such as exception edges.
+
+        The generated graph is not cached.
+
+        :param bool exception_edges:    Should exception edges and the nodes that are only reachable through exception
+                                        edges be kept.
+        :return:                        A local transition graph with a special configuration.
+        :rtype:                         networkx.DiGraph
+        """
+
+        graph = self.transition_graph
+
+        # fast path
+        if exception_edges:
+            return graph
+
+        # BFS on local graph but ignoring certain types of graphs
+        g = networkx.DiGraph()
+        queue = [ n for n in graph if n is self.startpoint or graph.in_degree[n] == 0 ]
+        traversed = set(queue)
+
+        while queue:
+            node = queue.pop(0)
+            traversed.add(node)
+
+            g.add_node(node)
+            for _, dst, edge_data in graph.out_edges(node, data=True):
+                edge_type = edge_data.get('type', None)
+                if not exception_edges and edge_type == 'exception':
+                    # ignore this edge
+                    continue
+                g.add_edge(node, dst, **edge_data)
+
+                if dst not in traversed:
+                    traversed.add(dst)
+                    queue.append(dst)
 
         return g
 
