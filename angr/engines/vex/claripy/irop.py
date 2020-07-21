@@ -290,9 +290,9 @@ class SimIROp:
             if f is not None:
                 f = partial(f, claripy.fp.RM.default()) # always? really?
 
-            f = f if f is not None else getattr(self, '_fgeneric_' + self._generic_name, None)
+            f = f if f is not None else getattr(self, '_op_fgeneric_' + self._generic_name, None)
             if f is None:
-                raise SimOperationError("no implementation found for operation {}".format(self._generic_name))
+                raise SimOperationError("no fp implementation found for operation {}".format(self._generic_name))
 
             self._calculate = partial(self._auto_vectorize, f)
 
@@ -469,6 +469,31 @@ class SimIROp:
             )
         return claripy.Concat(*(self._op_float_mapped(rm_part + ca).raw_to_bv() for ca in chopped_args))
 
+    @supports_vector
+    def _op_generic_Dup(self, args):
+        """
+        Vector duplication
+
+        Iop_Dup8x8
+        Iop_Dup8x16
+        Iop_Dup16x4
+        Iop_Dup16x8
+        Iop_Dup32x2
+        Iop_Dup32x4
+        """
+        arg_num = len(args)
+        if arg_num != 1:
+            raise SimOperationError("expect exactly one vector to be duplicated, got %d" % arg_num)
+        # Duplicate the vector for this many times
+        vector_count = self._vector_count
+        # Keep a copy of the vector to be duplicated
+        elem = args[0]
+        # Do the duplication
+        expr = elem
+        for _ in range(1, vector_count):
+            expr = claripy.Concat(elem, expr)
+        return expr
+
     def _op_concat(self, args):
         return claripy.Concat(*args)
 
@@ -500,6 +525,71 @@ class SimIROp:
                     piece = piece.raw_to_fp()
                 pieces.append(piece)
             yield pieces
+
+    @supports_vector
+    def _op_generic_GetElem(self, args):
+        """
+        Transfers one byte/half-word/word of a vector to a general-purpose register.
+
+        NOTE: the index should starts from the least significant bits.
+        For example, index 0 for Iop_GetElem32x2 returns the low half of a vector
+
+        Iop_GetElem8x8
+        Iop_GetElem16x4
+        Iop_GetElem32x2
+        Iop_GetElem8x16
+        Iop_GetElem16x8
+        Iop_GetElem32x4
+        Iop_GetElem64x2
+        """
+        # Size of the element
+        vector_size = self._vector_size
+        # Vector count
+        vector_count = self._vector_count
+        # Extension register value, element index
+        dReg, index = args
+        # Chopped elements; there should be `vector_count` elements in total
+        elements = dReg.chop(vector_size)
+
+        # Handle the index as symbolic
+        expr = elements[vector_count - 1]
+        for i in range(vector_count - 2, -1, -1):
+            # Iterate through the element from the second from LSB to the first from the MSB
+            expr = claripy.If(index == vector_count - i - 1, elements[i], expr)
+            # Example output: <BV32 if index == 0x1 then d0[63:32] else d0[31:0]>
+        return expr
+
+    @supports_vector
+    def _op_generic_SetElem(self, args):
+        """
+        Transfers one byte/half-word/word to a vector from a general-purpose register.
+
+        NOTE: the index should starts from the least significant bits.
+        For example, index 0 for Iop_SetElem32x2 sets the low half of a vector
+
+        Iop_SetElem8x8
+        Iop_SetElem16x4
+        Iop_SetElem32x2
+        Iop_SetElem8x16
+        Iop_SetElem16x8
+        Iop_SetElem32x4
+        Iop_SetElem64x2
+        """
+        # Size of the element
+        vector_size = self._vector_size
+        # Element count
+        vector_count = self._vector_count
+        # Extension register value, element index, element to set
+        dReg, index, element = args
+        # Chopped elements; there should be `vector_count` elements in total
+        elements = dReg.chop(vector_size)
+
+        # Generate new elements
+        new_elements = map(
+            lambda i: claripy.If(vector_count - 1 - i == index, element, elements[i]),
+            range(vector_count)
+        )
+        return claripy.Concat(*new_elements)
 
     def _op_generic_Mull(self, args):
         op1, op2 = args
@@ -786,9 +876,19 @@ class SimIROp:
             (claripy.fpEQ(a, b), claripy.BVV(0x40, 32)),
             ), claripy.BVV(0x45, 32))
 
-    def _op_fgeneric_CmpEQ(self, a0, a1): # pylint: disable=no-self-use
+    @staticmethod
+    def _fp_vector_comparison(cmp, a0, a1):
         # for cmpps_eq stuff, i.e. Iop_CmpEQ32Fx4
-        return claripy.If(claripy.fpEQ(a0, a1), claripy.BVV(-1, len(a0)), claripy.BVV(0, len(a0)))
+        return claripy.If(cmp(a0, a1), claripy.BVV(-1, len(a0)), claripy.BVV(0, len(a0)))
+
+    def _op_fgeneric_CmpEQ(self, a0, a1):
+        return self._fp_vector_comparison(claripy.fpEQ, a0, a1)
+
+    def _op_fgeneric_CmpLE(self, a0, a1):
+        return self._fp_vector_comparison(claripy.fpLT, a0, a1)
+
+    def _op_fgeneric_CmpLT(self, a0, a1):
+        return self._fp_vector_comparison(claripy.fpLEQ, a0, a1)
 
     def _auto_vectorize(self, f, args, rm=None, rm_passed=False):
         if rm is not None:
@@ -821,10 +921,10 @@ class SimIROp:
         a, b = a.raw_to_fp(), b.raw_to_fp()
         return claripy.If(cmp_op(a, b), a, b)
 
-    def _fgeneric_Min(self, a, b):
+    def _op_fgeneric_Min(self, a, b):
         return self._fgeneric_minmax(claripy.fpLT, a, b)
 
-    def _fgeneric_Max(self, a, b):
+    def _op_fgeneric_Max(self, a, b):
         return self._fgeneric_minmax(claripy.fpGT, a, b)
 
     def _op_fgeneric_Reinterp(self, args):

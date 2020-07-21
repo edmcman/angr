@@ -51,8 +51,8 @@ def _build_native():
     try:
         import unicorn
         import pyvex
-    except ImportError:
-        raise LibError("You must install unicorn and pyvex before building angr")
+    except ImportError as e:
+        raise LibError("You must install unicorn and pyvex before building angr: %s" % e)
 
     env = os.environ.copy()
     env_data = (('UNICORN_INCLUDE_PATH', 'unicorn', 'include'),
@@ -133,7 +133,7 @@ _UNICORN = "unicorn>=1.0.2rc2"
 
 setup(
     name='angr',
-    version='8.20.6.1',
+    version='8.20.7.6',
     python_requires='>=3.6',
     description='A multi-architecture binary analysis toolkit, with the ability to perform dynamic symbolic execution and various static analyses on binaries',
     url='https://github.com/angr/angr',
@@ -147,17 +147,18 @@ setup(
         'networkx>=2.0',
         'progressbar2',
         'rpyc',
-        'cffi>=1.7.0',
+        'cffi>=1.14.0',
         _UNICORN,
-        'archinfo==8.20.6.1',
-        'claripy==8.20.6.1',
-        'cle==8.20.6.1',
-        'pyvex==8.20.6.1',
-        'ailment==8.20.6.1',
+        'archinfo==8.20.7.6',
+        'claripy==8.20.7.6',
+        'cle==8.20.7.6',
+        'pyvex==8.20.7.6',
+        'ailment==8.20.7.6',
         'GitPython',
         'psutil',
         'pycparser>=2.18',
         'itanium_demangler',
+        'CppHeaderParser',
         'protobuf',
     ],
     setup_requires=[_UNICORN, 'pyvex'],

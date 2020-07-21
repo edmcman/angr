@@ -47,8 +47,10 @@ class CodeLocation:
             ss = [ ]
             if self.info:
                 for k, v in self.info.items():
-                    ss.append("%s=%s" % (k, v))
-                s += " with %s" % ", ".join(ss)
+                    if v != tuple() and v is not None:
+                        ss.append("%s=%s" % (k, v))
+                if ss:
+                    s += " with %s" % ", ".join(ss)
             s += ">"
 
             return s
@@ -65,13 +67,15 @@ class CodeLocation:
         Check if self is the same as other.
         """
         return type(self) is type(other) and self.block_addr == other.block_addr and \
-               self.stmt_idx == other.stmt_idx and self.sim_procedure is other.sim_procedure
+               self.stmt_idx == other.stmt_idx and self.sim_procedure is other.sim_procedure and \
+               self.info.get('context', None) == other.info.get('context', None)
 
     def __hash__(self):
         """
         returns the hash value of self.
         """
-        return hash((self.block_addr, self.stmt_idx, self.sim_procedure))
+        context = self.info.get('context', None)
+        return hash((self.block_addr, self.stmt_idx, self.sim_procedure, context))
 
     def _store_kwargs(self, **kwargs):
         for k, v in kwargs.items():
