@@ -208,8 +208,14 @@ class Tracer(ExplorationTechnique):
             if len(simgr.active) == 0:
                 raise AngrTracerError("Could not step to the first address of the trace - simgr is empty")
             elif len(simgr.active) > 1:
-                raise AngrTracerError("Could not step to the first address of the trace - state split")
+                if self._mode == TracingMode.Permissive:
+                    l.warning("State split before reaching the program entry point.  Choosing a random state and continuing anyway because Permissive mode is enabled.")
+                    simgr.drop(stash='active', filter_func=lambda x: x != simgr.one_active)
+                else:
+                    raise AngrTracerError("Could not step to the first address of the trace - state split.  Consider enabling Permissive mode.")
             simgr.drop(stash='unsat')
+
+        l.debug("We have reached the entry point of the program")
 
         # initialize the state info
         simgr.one_active.globals['trace_idx'] = idx
