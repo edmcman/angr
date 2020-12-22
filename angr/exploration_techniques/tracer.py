@@ -6,6 +6,7 @@ from capstone import CS_GRP_CALL, CS_GRP_IRET, CS_GRP_JUMP, CS_GRP_RET
 from . import ExplorationTechnique
 from .. import BP_BEFORE, BP_AFTER, sim_options
 from ..errors import AngrTracerError
+from .. import SIM_PROCEDURES
 
 l = logging.getLogger(name=__name__)
 
@@ -42,8 +43,6 @@ class RepHook:
         return p.execute(state, None, arguments=e_args)
 
     def run(self, state):
-
-        from .. import SIM_PROCEDURES # pylint: disable=import-outside-toplevel
 
         dst = state.regs.edi if state.arch.name == "X86" else state.regs.rdi
 
@@ -459,6 +458,17 @@ class Tracer(ExplorationTechnique):
             elif state.addr == getattr(self.project.simos, 'vsyscall_addr', None):
                 if not self._sync_callsite(state, idx, state.history.addr):
                     raise AngrTracerError("Could not synchronize following vsyscall")
+            elif isinstance(proc, SIM_PROCEDURES['linux_loader']['IFuncResolver']):
+                # This is an indirect function call.  There is no
+                # guarantee that angr will execute the same code as
+                # the trace.  So we sync to the return of the indirect
+                # call.  Hopefully it returns...
+                l.info("Handling Indirect function call %s", proc)
+
+                # XXX Set assert_obj
+                if not self._sync_return(state, idx):
+                    raise AngrTracerError("Could not synchronize following indirect function call")
+
             else:
                 # see above
                 pass
@@ -682,7 +692,7 @@ class Tracer(ExplorationTechnique):
         try:
             sync_idx = self._trace.index(addr_translated, idx)
         except ValueError:
-            l.error("Trying to synchronize at %#x (%#x) but it does not appear in the trace?")
+            l.error("Trying to synchronize at %#x (%#x) but it does not appear in the trace?", addr, addr_translated)
             return False
 
         state.globals['sync_idx'] = sync_idx
