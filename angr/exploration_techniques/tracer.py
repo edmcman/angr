@@ -437,6 +437,10 @@ class Tracer(ExplorationTechnique):
         elif state.history.jumpkind.startswith('Ijk_Exit'):
             # termination! will be handled by filter
             pass
+        elif state.history.jumpkind.startswith('Ijk_Sys'):
+            # syscalls
+            state.globals['sync_idx'] = idx + 1
+            state.globals['sync_timer'] = 1
         elif self._compare_addr(self._trace[idx + 1], state.addr):
             # normal case
             state.globals['trace_idx'] = idx + 1
@@ -472,10 +476,6 @@ class Tracer(ExplorationTechnique):
             else:
                 # see above
                 pass
-        elif state.history.jumpkind.startswith('Ijk_Sys'):
-            # syscalls
-            state.globals['sync_idx'] = idx + 1
-            state.globals['sync_timer'] = 1
         elif self.project.is_hooked(state.history.addr):
             # simprocedures - is this safe..?
             self._fast_forward(state)
@@ -621,10 +621,12 @@ class Tracer(ExplorationTechnique):
 
         slide = self._aslr_slides[obj]
         trace_addr = self._trace[idx + 1] - slide
-        l.info("Misfollow: angr says %#x, trace says %#x", angr_addr, trace_addr)
+        l.info("Misfollow: angr says %s, trace says %s",
+               state.project.loader.describe_addr(angr_addr),
+               state.project.loader.describe_addr(trace_addr))
 
         if not obj.contains_addr(trace_addr):
-            l.error("Translated trace address lives in a different object from the angr trace")
+            l.error("Translated trace address lives in a different object from the angr trace, raw address is %#x", self._trace[idx + 1])
             return False
 
         # TODO: add rep handling
