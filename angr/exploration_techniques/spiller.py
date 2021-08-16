@@ -218,7 +218,9 @@ class Spiller(ExplorationTechnique):
         return self._vault.store(state)
 
     def _load_state(self, sid):
-        return self._vault.load(sid)
+        st = self._vault.load(sid)
+        self._vault.delete(sid)
+        return st
 
     def step(self, simgr, stash='active', **kwargs):
         simgr = simgr.step(stash=stash, **kwargs)

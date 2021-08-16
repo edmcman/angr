@@ -14,8 +14,147 @@ import claripy
 
 l = logging.getLogger("angr.vault")
 
+class WeakKeyValueDict(object):
+    """
+    A dict in which items are removed whenever either key or value are
+    garbage-collected.
+    """
+    def __init__(self, *args, **kw):
+        init_dict = dict(*args, **kw)
+        
+        self._d = weakref.WeakKeyDictionary(
+            (key, self._create_value(key, value))
+            for key, value in init_dict.items())
+
+    def _create_value(self, key, value):
+        key_weakref = weakref.ref(key)
+        def value_collected(wr):
+            #l.warning("deleting %s %s", wr(), key_weakref())
+            try:
+                del self._d[key_weakref()]
+            # Weird stuff happens when claripy objects go in sets...
+            except (AttributeError, TypeError) as e:
+                l.warning("Ignoring exception %s when deleting %s %s", e, key_weakref(), key_weakref().__class__)
+                pass
+
+        return weakref.ref(value, value_collected)
+
+    def __getitem__(self, key):
+        return self._d[key]()
+    
+    def __setitem__(self, key, value):
+        self._d[key] = self._create_value(key, value)
+
+    def __delitem__(self, key):
+        del self._d[key]
+
+    def __len__(self):
+        return len(self._d)
+
+    def __cmp__(self, other):
+        try:
+            return cmp(sorted(self.items()),
+                       sorted(other.items()))
+        except AttributeError:
+            return NotImplemented
+
+    def __hash__(self):
+        raise TypeError("%s objects not hashable" % (self.__class__.__name__,))
+
+    def __contains__(self, key):
+        return key in self._d
+
+    def __iter__(self):
+        return self.keys()
+
+    def iterkeys(self):
+        return self._d.keys()
+
+    def keys(self):
+        return list(self.iterkeys())
+
+    def itervalues(self):
+        for value in self._d.itervalues():
+            yield value()
+
+    def values(self):
+        return list(self.itervalues())
+    
+    def iteritems(self):
+        for key in self._d:
+            yield self._d[key]()
+
+    def items(self):
+        return list(self.iteritems())
+
+    def update(self, other):
+        for key, value in other.iteritems():
+            self[key] = value
+
+    def __repr__(self):
+        return repr(self._d)
+
+    def clear(self):
+        self._d.clear()
+
+    def copy(self):
+        return WeakKeyValueDict(self)
+
+    def get(self, key, default=None):
+        if key in self:
+            return self[key]
+        return default
+
+    def has_key(self, key):
+        return key in self
+
+    def pop(self, key, *args):
+        if args:
+            return self._pop_with_default(key, *args)
+        return self._pop(key)
+
+    def _pop(self, key):
+        return self._d.pop(key)()
+    
+    def _pop_with_default(self, key, default):
+        if key in self:
+            return self._d.pop(key)
+        return default
+
+    def popitem(self):
+        key, value = self._d.popitem()
+        return key, value()
+
+    def setdefault(self, key, default):
+        if key in self:
+            return self[key]
+        self[key] = default
+        return default
+
+class PersistentID:
+    """
+    This is a wrapper class just so we can track weak references to the ID
+    """
+    def __init__(self, name):
+        self.name = name
+
+    def encode(self, encoding):
+        return self.name.encode(encoding)
+
+    def __lt__(self, other):
+        return self.name < other.name
+
+    def __eq__(self, other):
+        return self.name == other.name
+
+    def __hash__(self):
+        return hash(self.name)
+
+    def __str__(self):
+        return "PersistentId: %s" % self.name
+
 class VaultPickler(pickle.Pickler):
-    def __init__(self, vault, file, *args, assigned_objects=(), **kwargs):
+    def __init__(self, vault, file, assigned_pid=None, assigned_object=None, *args, **kwargs):
         """
         A persistence-aware pickler.
         It will check for persistence of any objects except for those with IDs in 'assigned_objects'.
@@ -23,17 +162,21 @@ class VaultPickler(pickle.Pickler):
 
         super().__init__(file, *args, **kwargs)
         self.vault = vault
-        self.assigned_objects = assigned_objects
+        self.assigned_object = assigned_object
+        self.assigned_pid = assigned_pid
 
     def persistent_id(self, obj):
-        if any(obj is o for o in self.assigned_objects):
+
+        if obj is self.assigned_object:
             return None
 
         pid = self.vault._get_persistent_id(obj)
         if pid is None:
             return None
 
-        # l.debug("Persistent store: %s %s", obj, pid)
+        # assigned_object depends on pid
+        self.vault._deps.setdefault(self.assigned_pid, set()).add (pid)
+
         return self.vault._store(obj, pid)
 
 class VaultUnpickler(pickle.Unpickler):
@@ -53,13 +196,13 @@ class Vault(collections.abc.MutableMapping):
     # These MUST be overriden.
     #
 
-    def _read_context(self, i):
+    def _read_context(self, strid):
         """
         Should be a context that yields a pickle-read()able file object for the given id i.
         """
         raise NotImplementedError()
 
-    def _write_context(self, i):
+    def _write_context(self, strid):
         """
         Should be a context that yields a pickle-write()able file object for the given id i.
         """
@@ -71,51 +214,69 @@ class Vault(collections.abc.MutableMapping):
         """
         raise NotImplementedError()
 
+    def _delete(self, strid):
+        raise NotImplementedError()
+
     #
     # Persistance managers
     #
 
     def __init__(self):
-        self._object_cache = weakref.WeakValueDictionary()
-        self._uuid_cache = weakref.WeakKeyDictionary()
-        self.stored = set()
-        self.storing = set()
+        # map from pid to object
+        self._object_cache = WeakKeyValueDict()
+        # map from object to pid
+        self._uuid_cache = WeakKeyValueDict()
+        # map from oid to PersistentID
+        self._pid_cache = weakref.WeakValueDictionary()
+        # If the key is referenced, also reference the value
+        self._deps = weakref.WeakKeyDictionary()
+        self.stored = set() # explicitly stored objects
+        self._weak_stored = weakref.WeakSet() # implicit
         self.hash_dedup = {
             claripy.ast.Base, claripy.ast.BV, claripy.ast.FP, claripy.ast.Bool, claripy.ast.Int, claripy.ast.Bits,
         }
         self.module_dedup = set() # {'claripy', 'angr', 'archinfo', 'pyvex' } # cle causes recursion
         self.uuid_dedup = { SimState, Project }
         self.unsafe_key_baseclasses = {
-            claripy.ast.Base, SimType
+            claripy.ast.Base, SimType #, SimActionObject
         }
+
+    def _string_id_to_persistent_id(self, strid):
+        if strid not in self._pid_cache:
+            tmp = PersistentID(strid)
+            self._pid_cache[strid] = tmp
+
+        return self._pid_cache[strid]
 
     def _get_persistent_id(self, o):
         """
         Determines a persistent ID for an object.
         Does NOT do stores.
         """
+
         if type(o) in self.hash_dedup:
-            oid = o.__class__.__name__ + "-" + str(hash(o))
+            oid = self._string_id_to_persistent_id (o.__class__.__name__ + "-" + str(hash(o)))
             self._object_cache[oid] = o
             return oid
 
         if any(isinstance(o,c) for c in self.unsafe_key_baseclasses):
             return None
 
-        try:
-            return self._uuid_cache[o]
-        except KeyError:
-            pass
-        except TypeError:
-            return None
-
         #if type(o) in self.uuid_dedup:
         #    return self._get_id(o)
-        if o.__class__.__module__.split('.')[0] in self.module_dedup or o.__class__ in self.uuid_dedup:
-            oid = o.__class__.__name__.split(".")[-1] + '-' + str(uuid.uuid4())
-            self._object_cache[oid] = o
-            self._uuid_cache[o] = oid
-            return oid
+        try:
+            if o.__class__.__module__.split('.')[0] in self.module_dedup or o.__class__ in self.uuid_dedup:
+                if o in self._uuid_cache:
+                    return self._uuid_cache[o]
+                else:
+                    oid = self._string_id_to_persistent_id (o.__class__.__name__.split(".")[-1] + '-' + str(uuid.uuid4()))
+                    self._object_cache[oid] = o
+                    self._uuid_cache[o] = oid
+                    return oid
+
+        except TypeError:
+            #l.warning("Unable to get persistent id of %s", o)
+            pass
 
         return None
 
@@ -123,72 +284,83 @@ class Vault(collections.abc.MutableMapping):
     # Other stuff
     #
 
-    def is_stored(self, i):
+    def is_stored(self, pid):
         """
         Checks if the provided id is already in the vault.
         """
-        if i in self.stored:
+        if pid in self._weak_stored:
             return True
 
         try:
-            with self._read_context(i):
+            with self._read_context(pid.name):
                 return True
         except (AngrVaultError, EOFError):
             return False
 
-    def load(self, oid):
-        return self._load(oid)
+    def load(self, pid):
+        return self._load(pid)
 
-    def _load(self, oid):
+    def _load(self, pid):
         """
         Retrieves one object from the pickler with the provided id.
 
-        :param oid: an ID to use
+        :param pid: an ID to use
         """
         # l.debug("LOAD: %s", oid)
         try:
             # l.debug("... trying cached")
-            return self._object_cache[oid]
+            return self._object_cache[pid]
         except KeyError:
             # l.debug("... cached failed")
-            with self._read_context(oid) as u:
+            with self._read_context(pid.name) as u:
                 # add newly loaded object into the object cache
                 o = VaultUnpickler(self, u).load()
-                self._object_cache[oid] = o
+                self._object_cache[pid] = o
                 return o
 
     def store(self, o):
 
-        actual_id = self._get_persistent_id(o) or "TMP-"+str(uuid.uuid4())
+        pid = self._get_persistent_id(o) or self._string_id_to_persistent_id("TMP-"+str(uuid.uuid4()))
 
-        return self._store(o, actual_id)
+        self.stored.add (pid)
 
-    def _store(self, o, oid): #pylint:disable=redefined-builtin
+        return self._store(o, pid)
+
+    def _finalize(self, oid):
+        l.debug("%s is no longer reachable in the vault; finalizing", oid)
+        self._delete (oid)
+
+    def _store(self, o, pid): #pylint:disable=redefined-builtin
         """
         Stores an object and returns its ID.
 
         :param o: the object
-        :param oid: an ID to use
+        :param pid: an ID to use
         """
 
-        actual_id = oid
+        #l.warning("STORE: %s %s", o, pid)
 
-        # l.debug("STORE: %s %s", o, actual_id)
+        # this handles recursive and existing objects
+        if pid in self._weak_stored:
+            return pid
 
-        # this handles recursive objects
-        if actual_id in self.storing:
-            return actual_id
+        if self.is_stored(pid):
+            #l.warning("... already stored")
+            return pid
 
-        if self.is_stored(actual_id):
-            # l.debug("... already stored")
-            return actual_id
+        with self._write_context(pid.name) as output:
+            weakref.finalize(pid, self._finalize, pid.name)
+            self._weak_stored.add(pid)
+            VaultPickler(self, output, assigned_pid=pid, assigned_object=o).dump(o)
 
-        with self._write_context(actual_id) as output:
-            self.storing.add(actual_id)
-            VaultPickler(self, output, assigned_objects=(o,)).dump(o)
-            self.stored.add(actual_id)
+        return pid
 
-        return actual_id
+
+    def delete(self, pid):
+        self.stored.remove (pid)
+
+        # This will cause pid's object to become unreachable and
+        # finalized, so there is no reason to call _delete
 
     def dumps(self, o):
         """
@@ -214,8 +386,10 @@ class Vault(collections.abc.MutableMapping):
 
         self._object_cache.clear()
         self._uuid_cache.clear()
+        self._pid_cache.clear()
+        self._deps.clear()
         self.stored.clear()
-        self.storing.clear()
+        self._weak_stored.clear()
 
     @staticmethod
     def close():
@@ -232,7 +406,7 @@ class Vault(collections.abc.MutableMapping):
         return self.load(k)
 
     def __delitem__(self, k):
-        raise AngrVaultError("We currently don't support deletion from the vault.")
+        return self.delete(k)
 
     def __iter__(self):
         return iter(self.keys())
@@ -249,22 +423,29 @@ class VaultDict(Vault):
         self._dict = { } if d is None else d
 
     @contextlib.contextmanager
-    def _write_context(self, i):
+    def _write_context(self, strid):
         f = io.BytesIO()
         yield f
         f.seek(0)
-        self._dict[i] = f.read()
+        self._dict[strid] = f.read()
 
     @contextlib.contextmanager
-    def _read_context(self, i):
+    def _read_context(self, strid):
         try:
-            f = io.BytesIO(self._dict[i])
+            f = io.BytesIO(self._dict[strid])
             yield f
         except KeyError as e:
             raise AngrVaultError from e
 
-    def is_stored(self, i):
-        return i in self._dict
+    def _delete(self, oid):
+        if oid in self._dict:
+            l.debug("_deleting %s", oid)
+            del self._dict[oid]
+        else:
+            l.warning("%s was not in _dict", oid)
+
+    def is_stored(self, pid):
+        return pid.name in self._dict
 
     def keys(self):
         return self._dict.keys()
@@ -280,14 +461,14 @@ class VaultDir(Vault):
             os.makedirs(self._dir)
 
     @contextlib.contextmanager
-    def _write_context(self, i):
-        with open(os.path.join(self._dir, i), "wb") as o:
+    def _write_context(self, strid):
+        with open(os.path.join(self._dir, strid), "wb") as o:
             yield o
 
     @contextlib.contextmanager
-    def _read_context(self, i):
+    def _read_context(self, strid):
         try:
-            with open(os.path.join(self._dir, i), "rb") as o:
+            with open(os.path.join(self._dir, strid), "rb") as o:
                 yield o
         except FileNotFoundError as e:
             raise AngrVaultError from e
