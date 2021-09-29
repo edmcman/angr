@@ -76,6 +76,8 @@ class Vault(collections.abc.MutableMapping):
     #
 
     def __init__(self):
+        self._pid_cache = dict()
+        self._memo_cache = dict()
         self._object_cache = weakref.WeakValueDictionary()
         self._uuid_cache = weakref.WeakKeyDictionary()
         self.stored = set()
@@ -89,35 +91,43 @@ class Vault(collections.abc.MutableMapping):
             claripy.ast.Base, SimType
         }
 
+
     def _get_persistent_id(self, o):
         """
         Determines a persistent ID for an object.
         Does NOT do stores.
         """
-        if type(o) in self.hash_dedup:
-            oid = o.__class__.__name__ + "-" + str(hash(o))
-            self._object_cache[oid] = o
-            return oid
+        if id(o) in self._pid_cache:
+            return self._pid_cache[id(o)]
+        else:
+            def _get_persistent_id_helper(o):
+                if type(o) in self.hash_dedup:
+                    oid = o.__class__.__name__ + "-" + str(hash(o))
+                    self._object_cache[oid] = o
+                    return oid
 
-        if any(isinstance(o,c) for c in self.unsafe_key_baseclasses):
-            return None
+                if any(isinstance(o,c) for c in self.unsafe_key_baseclasses):
+                    return None
 
-        try:
-            return self._uuid_cache[o]
-        except KeyError:
-            pass
-        except TypeError:
-            return None
+                try:
+                    return self._uuid_cache[o]
+                except KeyError:
+                    pass
+                except TypeError:
+                    return None
 
-        #if type(o) in self.uuid_dedup:
-        #    return self._get_id(o)
-        if o.__class__.__module__.split('.')[0] in self.module_dedup or o.__class__ in self.uuid_dedup:
-            oid = o.__class__.__name__.split(".")[-1] + '-' + str(uuid.uuid4())
-            self._object_cache[oid] = o
-            self._uuid_cache[o] = oid
-            return oid
+                #if type(o) in self.uuid_dedup:
+                #    return self._get_id(o)
+                if o.__class__.__module__.split('.')[0] in self.module_dedup or o.__class__ in self.uuid_dedup:
+                    oid = o.__class__.__name__.split(".")[-1] + '-' + str(uuid.uuid4())
+                    self._object_cache[oid] = o
+                    self._uuid_cache[o] = oid
+                    return oid
 
-        return None
+                return None
+            tmp = _get_persistent_id_helper(o)
+            self._pid_cache[id(o)] = tmp
+            return tmp
 
     #
     # Other stuff
@@ -157,7 +167,23 @@ class Vault(collections.abc.MutableMapping):
                 self._object_cache[oid] = o
                 return o
 
+
+    def store_many(self, *objs):
+        tmp = [self._store_one (o) for o in objs]
+        self._pid_cache.clear ()
+        self._memo_cache.clear ()
+        #self._dict.sync()
+        return tmp
+
     def store(self, o):
+        tmp = self._store_one (o)
+        self._pid_cache.clear ()
+        self._memo_cache.clear ()
+        return tmp
+
+    def _store_one(self, o):
+
+        l.warning("Storing %s...", o)
 
         actual_id = self._get_persistent_id(o) or "TMP-"+str(uuid.uuid4())
 
@@ -212,6 +238,7 @@ class Vault(collections.abc.MutableMapping):
 
     def _clear_cache(self):
 
+        self._pid_cache.clear()
         self._object_cache.clear()
         self._uuid_cache.clear()
         self.stored.clear()
@@ -302,7 +329,7 @@ class VaultShelf(VaultDict):
     """
     def __init__(self, path=None):
         self._path = tempfile.mktemp() if path is None else path
-        s = shelve.open(self._path, protocol=-1)
+        s = shelve.open(self._path, flag="c", protocol=-1)
         super().__init__(s)
 
     def close(self):
