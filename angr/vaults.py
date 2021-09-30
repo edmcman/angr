@@ -9,6 +9,7 @@ import shelve
 import uuid
 import os
 import io
+import time
 
 import claripy
 
@@ -168,9 +169,11 @@ class Vault(collections.abc.MutableMapping):
 
 
     def store_many(self, *objs):
+        bt = time.time ()
         tmp = [self._store_one (o) for o in objs]
         self._pid_cache.clear ()
-        #self._dict.sync()
+        at = time.time()
+        l.info("Spilled %d states to the vault in %f seconds (%f per second)", len(objs), at - bt, len(objs) / (at - bt))
         return tmp
 
     def store(self, o):
@@ -179,8 +182,6 @@ class Vault(collections.abc.MutableMapping):
         return tmp
 
     def _store_one(self, o):
-
-        l.warning("Storing %s...", o)
 
         actual_id = self._get_persistent_id(o) or "TMP-"+str(uuid.uuid4())
 
