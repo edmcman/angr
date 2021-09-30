@@ -77,7 +77,6 @@ class Vault(collections.abc.MutableMapping):
 
     def __init__(self):
         self._pid_cache = dict()
-        self._memo_cache = dict()
         self._object_cache = weakref.WeakValueDictionary()
         self._uuid_cache = weakref.WeakKeyDictionary()
         self.stored = set()
@@ -171,14 +170,12 @@ class Vault(collections.abc.MutableMapping):
     def store_many(self, *objs):
         tmp = [self._store_one (o) for o in objs]
         self._pid_cache.clear ()
-        self._memo_cache.clear ()
         #self._dict.sync()
         return tmp
 
     def store(self, o):
         tmp = self._store_one (o)
         self._pid_cache.clear ()
-        self._memo_cache.clear ()
         return tmp
 
     def _store_one(self, o):
