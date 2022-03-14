@@ -278,7 +278,7 @@ class Tracer(ExplorationTechnique):
                     raise AngrTracerError("Could not step to the first address of the trace - state split. Do you want to have a Tracer(fast_forward_to_entry=False)?")
                 simgr.drop(stash='unsat')
         else:
-            idx = -1
+            idx = 0
 
         # initialize the state info
         simgr.one_active.globals['trace_idx'] = idx
