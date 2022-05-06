@@ -1,3 +1,4 @@
+# pylint:disable=wrong-import-position,wrong-import-order
 from typing import Optional, List, Tuple
 import logging
 from collections import defaultdict
@@ -6,11 +7,12 @@ import claripy
 import pyvex
 import ailment
 
+import angr.errors
 from ...storage.memory_mixins.paged_memory.pages.multi_values import MultiValues
 from ...block import Block
 from ...errors import AngrVariableRecoveryError, SimEngineError
 from ...knowledge_plugins import Function
-from ...sim_variable import SimStackVariable, SimRegisterVariable, SimVariable
+from ...sim_variable import SimStackVariable, SimRegisterVariable, SimVariable, SimMemoryVariable
 from ...engines.vex.claripy.irop import vexop_to_simop
 from ..forward_analysis import ForwardAnalysis, FunctionGraphVisitor
 from ..typehoon.typevars import Equivalence, TypeVariable
@@ -29,11 +31,13 @@ class VariableRecoveryFastState(VariableRecoveryStateBase):
     :ivar KeyedRegion register_region:  The register store.
     """
     def __init__(self, block_addr, analysis, arch, func, stack_region=None, register_region=None, global_region=None,
-                 typevars=None, type_constraints=None, delayed_type_constraints=None, project=None):
+                 typevars=None, type_constraints=None, delayed_type_constraints=None, stack_offset_typevars=None,
+                 project=None):
 
         super().__init__(block_addr, analysis, arch, func, stack_region=stack_region, register_region=register_region,
                          global_region=global_region, typevars=typevars, type_constraints=type_constraints,
-                         delayed_type_constraints=delayed_type_constraints, project=project)
+                         delayed_type_constraints=delayed_type_constraints, stack_offset_typevars=stack_offset_typevars,
+                         project=project)
 
     def __repr__(self):
         return "<VRAbstractState@%#x: %d register variables, %d stack variables>" % (
@@ -57,6 +61,7 @@ class VariableRecoveryFastState(VariableRecoveryStateBase):
             typevars=self.typevars.copy(),
             type_constraints=self.type_constraints.copy(),
             delayed_type_constraints=self.delayed_type_constraints.copy(),
+            stack_offset_typevars=dict(self.stack_offset_typevars),
             project=self.project,
         )
 
@@ -122,6 +127,25 @@ class VariableRecoveryFastState(VariableRecoveryStateBase):
                                       )
             delayed_typeconstraints[v1].add(equivalence)
 
+        stack_offset_typevars = {}
+        all_stack_addr_typevar_offsets = set(self.stack_offset_typevars)
+        for other in others:
+            all_stack_addr_typevar_offsets.update(other.stack_offset_typevars)
+        for offset in all_stack_addr_typevar_offsets:
+            all_typevars = set()
+            for state in (self,) + others:
+                typevar = state.stack_offset_typevars.get(offset, None)
+                if typevar is not None:
+                    all_typevars.add(typevar)
+
+            if len(all_typevars) == 1:
+                typevar = all_typevars.pop()
+            else:
+                typevar = TypeVariable()
+                for orig_typevar in all_typevars:
+                    merged_typeconstraints.add(Equivalence(orig_typevar, typevar))
+            stack_offset_typevars[offset] = typevar
+
         # clean up
         self.phi_variables = {}
         self.successor_block_addr = None
@@ -137,6 +161,7 @@ class VariableRecoveryFastState(VariableRecoveryStateBase):
             typevars=merged_typevars,
             type_constraints=merged_typeconstraints,
             delayed_type_constraints=delayed_typeconstraints,
+            stack_offset_typevars=stack_offset_typevars,
             project=self.project,
         )
 
@@ -199,7 +224,7 @@ class VariableRecoveryFast(ForwardAnalysis, VariableRecoveryBase):  #pylint:disa
         self._node_iterations = defaultdict(int)
 
         self._node_to_cc = { }
-        self.var_to_typevar = { }
+        self.var_to_typevars = defaultdict(set)
         self.type_constraints = None
 
         self._analyze()
@@ -226,7 +251,7 @@ class VariableRecoveryFast(ForwardAnalysis, VariableRecoveryBase):  #pylint:disa
             for func_node in function_nodes:
                 for callsite_node in self.function.transition_graph.predecessors(func_node):
                     if func_node.calling_convention is None:
-                        l.warning("Unknown calling convention for %r.", func_node)
+                        # l.warning("Unknown calling convention for %r.", func_node)
                         self._node_to_cc[callsite_node.addr] = None
                     else:
                         self._node_to_cc[callsite_node.addr] = func_node.calling_convention
@@ -234,7 +259,7 @@ class VariableRecoveryFast(ForwardAnalysis, VariableRecoveryBase):  #pylint:disa
     def _pre_job_handling(self, job):
         self._job_ctr += 1
         if self._low_priority:
-            self._release_gil(self._job_ctr, 5, 0.000001)
+            self._release_gil(self._job_ctr, 100, 0.000001)
 
     def _initial_abstract_state(self, node):
         state = VariableRecoveryFastState(node.addr, self, self.project.arch, self.function, project=self.project,
@@ -260,6 +285,15 @@ class VariableRecoveryFast(ForwardAnalysis, VariableRecoveryBase):  #pylint:disa
             state.stack_region.store(state.stack_addr_from_offset(ret_addr_offset),
                                      ret_addr,
                                      endness=self.project.arch.memory_endness)
+
+        if self.project.arch.name.startswith("MIPS"):
+            t9_offset, t9_size = self.project.arch.registers["t9"]
+            try:
+                t9_val = state.register_region.load(t9_offset, t9_size)
+                if state.is_top(t9_val):
+                    state.register_region.store(t9_offset, claripy.BVV(node.addr, t9_size*8))
+            except angr.errors.SimMemoryMissingError:
+                state.register_region.store(t9_offset, claripy.BVV(node.addr, t9_size * 8))
 
         if self._func_args:
             for arg in self._func_args:
@@ -322,7 +356,8 @@ class VariableRecoveryFast(ForwardAnalysis, VariableRecoveryBase):  #pylint:disa
 
         self._node_iterations[node.addr] += 1
         self.type_constraints |= state.type_constraints
-        self.var_to_typevar.update(state.typevars._typevars)
+        for var, typevar in state.typevars._typevars.items():
+            self.var_to_typevars[var].add(typevar)
 
         state.downsize()
         self._outstates[node.addr] = state
@@ -343,6 +378,13 @@ class VariableRecoveryFast(ForwardAnalysis, VariableRecoveryBase):  #pylint:disa
                     state.downsize_region(state.register_region),
                     state.downsize_region(state.stack_region),
                 )
+
+        # unify type variables for global variables
+        for var, typevars in self.var_to_typevars.items():
+            if len(typevars) > 1 and isinstance(var, SimMemoryVariable) and not isinstance(var, SimStackVariable):
+                sorted_typevars = list(sorted(typevars, key=lambda x: str(x)))  # pylint:disable=unnecessary-lambda
+                for tv in sorted_typevars[1:]:
+                    self.type_constraints.add(Equivalence(sorted_typevars[0], tv))
 
     #
     # Private methods
@@ -428,11 +470,6 @@ class VariableRecoveryFast(ForwardAnalysis, VariableRecoveryBase):  #pylint:disa
                 sp_v = next(iter(next(iter(sp.values.values()))))
 
             adjusted = False
-            cc = self._node_to_cc[block.addr]
-            if cc is not None and cc.sp_delta is not None:
-                sp_v += cc.sp_delta
-                adjusted = True
-                l.debug('Adjusting stack pointer at end of block %#x with offset %+#x.', block.addr, cc.sp_delta)
 
             if not adjusted:
                 # make a guess

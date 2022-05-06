@@ -40,8 +40,9 @@ class DefaultFillerMixin(MemoryMixin):
                  options.SYMBOL_FILL_UNCONSTRAINED_REGISTERS not in self.state.options
         if type(addr) is int and (is_mem or is_reg):
             if once('mem_fill_warning'):
-                l.warning("The program is accessing memory or registers with an unspecified value. "
-                          "This could indicate unwanted behavior.")
+                what = "memory" if is_mem else "register"
+                l.warning("The program is accessing %s with an unspecified value. "
+                          "This could indicate unwanted behavior.", what)
                 l.warning("angr will cope with this by generating an unconstrained symbolic variable and continuing. "
                           "You can resolve this by:")
                 l.warning("1) setting a value to the initial state")
@@ -70,11 +71,11 @@ class DefaultFillerMixin(MemoryMixin):
                 reg_str = self.state.arch.translate_register_name(addr, size=size)
                 l.warning("Filling register %s with %d unconstrained bytes referenced from %#x (%s)", reg_str, size, refplace_int, refplace_str)
                 if name is None and not reg_str.isdigit():
-                    name = reg_str
+                    name = 'reg_' + reg_str
 
         if name is None:
             if type(addr) is int:
-                name = '%s_%x' % (self.category, addr)
+                name = '%s_%x' % (self.id, addr)
             else:
                 name = self.category
 

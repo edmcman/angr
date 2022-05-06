@@ -1,5 +1,5 @@
 import weakref
-from typing import Optional, Iterable, Dict, Set, Generator, Tuple, Union, TYPE_CHECKING
+from typing import Optional, Iterable, Dict, Set, Generator, Tuple, Union, Any, TYPE_CHECKING
 import logging
 
 import claripy
@@ -13,7 +13,7 @@ from ...storage.memory_mixins import MultiValuedMemory
 from ...storage.memory_mixins.paged_memory.pages.multi_values import MultiValues
 from ...engines.light import SpOffset
 from ...code_location import CodeLocation
-from .atoms import Atom, Register, MemoryLocation, Tmp
+from .atoms import Atom, Register, MemoryLocation, Tmp, FunctionCall, ConstantSrc
 from .definition import Definition, Tag
 from .heap_address import HeapAddress
 from .uses import Uses
@@ -49,10 +49,16 @@ class DefinitionAnnotation(Annotation):
     def __hash__(self):
         return hash((self.definition, self.relocatable, self.eliminatable))
 
-    def __eq__(self, other: 'DefinitionAnnotation'):
-        return  self.definition == other.definition \
-            and self.relocatable == other.relocatable \
-            and self.eliminatable == other.eliminatable
+    def __eq__(self, other: 'object'):
+        if isinstance(other, DefinitionAnnotation):
+            return  self.definition == other.definition \
+                and self.relocatable == other.relocatable \
+                and self.eliminatable == other.eliminatable
+        else:
+            raise ValueError("DefinitionAnnotation can only check equality with other DefinitionAnnotation")
+
+    def __repr__(self):
+        return f"<{self.__class__.__name__}({repr(self.definition)})"
 
 # pylint: disable=W1116
 class LiveDefinitions:
@@ -397,16 +403,16 @@ class LiveDefinitions:
 
         return d
 
-    def add_use(self, atom: Atom, code_loc: CodeLocation) -> None:
+    def add_use(self, atom: Atom, code_loc: CodeLocation, expr: Optional[Any]=None) -> None:
         if isinstance(atom, Register):
-            self._add_register_use(atom, code_loc)
+            self._add_register_use(atom, code_loc, expr=expr)
         elif isinstance(atom, MemoryLocation):
             if isinstance(atom.addr, SpOffset):
-                self._add_stack_use(atom, code_loc)
+                self._add_stack_use(atom, code_loc, expr=expr)
             elif isinstance(atom.addr, HeapAddress):
-                self._add_heap_use(atom, code_loc)
+                self._add_heap_use(atom, code_loc, expr=expr)
             elif isinstance(atom.addr, int):
-                self._add_memory_use(atom, code_loc)
+                self._add_memory_use(atom, code_loc, expr=expr)
             else:
                 # ignore RegisterOffset
                 pass
@@ -415,21 +421,27 @@ class LiveDefinitions:
         else:
             raise TypeError("Unsupported atom type %s." % type(atom))
 
-    def add_use_by_def(self, definition: Definition, code_loc: CodeLocation) -> None:
+    def add_use_by_def(self, definition: Definition, code_loc: CodeLocation, expr: Any=None) -> None:
         if isinstance(definition.atom, Register):
-            self._add_register_use_by_def(definition, code_loc)
+            self._add_register_use_by_def(definition, code_loc, expr=expr)
         elif isinstance(definition.atom, MemoryLocation):
             if isinstance(definition.atom.addr, SpOffset):
-                self._add_stack_use_by_def(definition, code_loc)
+                self._add_stack_use_by_def(definition, code_loc, expr=expr)
             elif isinstance(definition.atom.addr, HeapAddress):
-                self._add_heap_use_by_def(definition, code_loc)
+                self._add_heap_use_by_def(definition, code_loc, expr=expr)
             elif isinstance(definition.atom.addr, int):
-                self._add_memory_use_by_def(definition, code_loc)
+                self._add_memory_use_by_def(definition, code_loc, expr=expr)
             else:
                 # ignore RegisterOffset
                 pass
         elif type(definition.atom) is Tmp:
             self._add_tmp_use_by_def(definition, code_loc)
+        elif type(definition.atom) is FunctionCall:
+            # ignore function calls
+            pass
+        elif type(definition.atom) is ConstantSrc:
+            # ignore constants
+            pass
         else:
             raise TypeError()
 
@@ -520,7 +532,7 @@ class LiveDefinitions:
     # Private methods
     #
 
-    def _add_register_use(self, atom: Register, code_loc: CodeLocation) -> None:
+    def _add_register_use(self, atom: Register, code_loc: CodeLocation, expr: Optional[Any]=None) -> None:
         # get all current definitions
         try:
             values: MultiValues = self.register_definitions.load(atom.reg_offset, size=atom.size)
@@ -530,25 +542,25 @@ class LiveDefinitions:
         for vs in values.values.values():
             for v in vs:
                 for def_ in self.extract_defs(v):
-                    self._add_register_use_by_def(def_, code_loc)
+                    self._add_register_use_by_def(def_, code_loc, expr=expr)
 
-    def _add_register_use_by_def(self, def_: Definition, code_loc: CodeLocation) -> None:
-        self.register_uses.add_use(def_, code_loc)
+    def _add_register_use_by_def(self, def_: Definition, code_loc: CodeLocation, expr: Optional[Any]=None) -> None:
+        self.register_uses.add_use(def_, code_loc, expr=expr)
         self.uses_by_codeloc[code_loc].add(def_)
 
-    def _add_stack_use(self, atom: MemoryLocation, code_loc: CodeLocation) -> None:
+    def _add_stack_use(self, atom: MemoryLocation, code_loc: CodeLocation, expr: Optional[Any]=None) -> None:
 
         if not isinstance(atom.addr, SpOffset):
             raise TypeError("Atom %r is not a stack location atom." % atom)
 
         for current_def in self.get_definitions(atom):
-            self._add_stack_use_by_def(current_def, code_loc)
+            self._add_stack_use_by_def(current_def, code_loc, expr=expr)
 
-    def _add_stack_use_by_def(self, def_: Definition, code_loc: CodeLocation) -> None:
-        self.stack_uses.add_use(def_, code_loc)
+    def _add_stack_use_by_def(self, def_: Definition, code_loc: CodeLocation, expr: Optional[Any]=None) -> None:
+        self.stack_uses.add_use(def_, code_loc, expr=expr)
         self.uses_by_codeloc[code_loc].add(def_)
 
-    def _add_heap_use(self, atom: MemoryLocation, code_loc: CodeLocation) -> None:
+    def _add_heap_use(self, atom: MemoryLocation, code_loc: CodeLocation, expr: Optional[Any]=None) -> None:
 
         if not isinstance(atom.addr, HeapAddress):
             raise TypeError("Atom %r is not a heap location atom." % atom)
@@ -556,22 +568,22 @@ class LiveDefinitions:
         current_defs = self.heap_definitions.get_objects_by_offset(atom.addr.value)
 
         for current_def in current_defs:
-            self._add_heap_use_by_def(current_def, code_loc)
+            self._add_heap_use_by_def(current_def, code_loc, expr=expr)
 
-    def _add_heap_use_by_def(self, def_: Definition, code_loc: CodeLocation) -> None:
-        self.heap_uses.add_use(def_, code_loc)
+    def _add_heap_use_by_def(self, def_: Definition, code_loc: CodeLocation, expr: Optional[Any]=None) -> None:
+        self.heap_uses.add_use(def_, code_loc, expr=expr)
         self.uses_by_codeloc[code_loc].add(def_)
 
-    def _add_memory_use(self, atom: MemoryLocation, code_loc: CodeLocation) -> None:
+    def _add_memory_use(self, atom: MemoryLocation, code_loc: CodeLocation, expr: Optional[Any]=None) -> None:
 
         # get all current definitions
         current_defs: Iterable[Definition] = self.get_definitions(atom)
 
         for current_def in current_defs:
-            self._add_memory_use_by_def(current_def, code_loc)
+            self._add_memory_use_by_def(current_def, code_loc, expr=expr)
 
-    def _add_memory_use_by_def(self, def_: Definition, code_loc: CodeLocation) -> None:
-        self.memory_uses.add_use(def_, code_loc)
+    def _add_memory_use_by_def(self, def_: Definition, code_loc: CodeLocation, expr: Optional[Any]=None) -> None:
+        self.memory_uses.add_use(def_, code_loc, expr=expr)
         self.uses_by_codeloc[code_loc].add(def_)
 
     def _add_tmp_use(self, atom: Tmp, code_loc: CodeLocation) -> None:

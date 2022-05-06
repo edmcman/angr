@@ -1,12 +1,14 @@
-from typing import Optional, Iterable, Set, Generator, Tuple, TYPE_CHECKING
+from typing import Optional, Iterable, Set, Generator, Tuple, Any, TYPE_CHECKING
 import logging
 
 import archinfo
 import claripy
 
 from ...storage.memory_mixins.paged_memory.pages.multi_values import MultiValues
+from ...storage.memory_mixins import MultiValuedMemory
 from ...knowledge_plugins.key_definitions import LiveDefinitions
-from ...knowledge_plugins.key_definitions.atoms import Atom, GuardUse, Register, MemoryLocation
+from ...knowledge_plugins.key_definitions.atoms import Atom, GuardUse, Register, MemoryLocation, FunctionCall, \
+    ConstantSrc
 from ...knowledge_plugins.key_definitions.definition import Definition
 from ...knowledge_plugins.key_definitions.environment import Environment
 from ...knowledge_plugins.key_definitions.tag import InitialValueTag, ParameterTag, Tag
@@ -50,10 +52,11 @@ class ReachingDefinitionsState:
     """
 
     __slots__ = ('arch', '_subject', '_track_tmps', 'analysis', 'current_codeloc', 'codeloc_uses', 'live_definitions',
-                 'all_definitions', '_canonical_size', 'heap_allocator', '_environment', )
+                 'all_definitions', '_canonical_size', 'heap_allocator', '_environment', '_track_calls',
+                 '_track_consts', )
 
-    def __init__(self, arch: archinfo.Arch, subject: Subject, track_tmps: bool=False,
-                 analysis: Optional['ReachingDefinitionsAnalysis']=None, rtoc_value=None,
+    def __init__(self, arch: archinfo.Arch, subject: Subject, track_tmps: bool=False, track_calls: bool=False,
+                 track_consts: bool=False, analysis: Optional['ReachingDefinitionsAnalysis']=None, rtoc_value=None,
                  live_definitions: Optional[LiveDefinitions]=None, canonical_size: int=8,
                  heap_allocator: HeapAllocator=None,
                  environment: Environment=None):
@@ -62,6 +65,8 @@ class ReachingDefinitionsState:
         self.arch = arch
         self._subject = subject
         self._track_tmps = track_tmps
+        self._track_calls = track_calls
+        self._track_consts = track_consts
         self.analysis = analysis
         self._canonical_size: int = canonical_size
 
@@ -128,7 +133,7 @@ class ReachingDefinitionsState:
         else:
             raise ValueError("Unsupported architecture word size %d" % self.arch.bits)
 
-    def annotate_with_def(self, symvar: claripy.ast.Base, definition: Definition):
+    def annotate_with_def(self, symvar: claripy.ast.Base, definition: Definition) -> claripy.ast.Base:
         """
 
         :param symvar:
@@ -157,11 +162,11 @@ class ReachingDefinitionsState:
         return self.live_definitions.register_uses
 
     @property
-    def register_definitions(self):
+    def register_definitions(self) -> MultiValuedMemory:
         return self.live_definitions.register_definitions
 
     @property
-    def stack_definitions(self):
+    def stack_definitions(self) -> MultiValuedMemory:
         return self.live_definitions.stack_definitions
 
     @property
@@ -169,7 +174,7 @@ class ReachingDefinitionsState:
         return self.live_definitions.stack_uses
 
     @property
-    def heap_definitions(self):
+    def heap_definitions(self) -> MultiValuedMemory:
         return self.live_definitions.heap_definitions
 
     @property
@@ -181,7 +186,7 @@ class ReachingDefinitionsState:
         return self.live_definitions.memory_uses
 
     @property
-    def memory_definitions(self):
+    def memory_definitions(self) -> MultiValuedMemory:
         return self.live_definitions.memory_definitions
 
     @property
@@ -245,28 +250,32 @@ class ReachingDefinitionsState:
             t9_def = Definition(t9_atom, ExternalCodeLocation(), tags={InitialValueTag()})
             t9 = self.annotate_with_def(claripy.BVV(func_addr, self.arch.bits), t9_def)
             self.register_definitions.store(t9_offset, t9)
+        if cc is not None:
+            prototype = self.analysis.kb.functions[func_addr].prototype
+            if prototype is not None:
+                for loc in cc.arg_locs(prototype):
+                    for arg in loc.get_footprint():
+                        # initialize register parameters
+                        if isinstance(arg, SimRegArg):
+                            # FIXME: implement reg_offset handling in SimRegArg
+                            reg_offset = self.arch.registers[arg.reg_name][0]
+                            reg_atom = Register(reg_offset, self.arch.bytes)
+                            reg_def = Definition(reg_atom, ExternalCodeLocation(),
+                                                 tags={ParameterTag(function=func_addr)})
+                            reg = self.annotate_with_def(self.top(self.arch.bits), reg_def)
+                            self.register_definitions.store(reg_offset, reg)
 
-        if cc is not None and cc.args is not None:
-            for arg in cc.args:
-                # initialize register parameters
-                if isinstance(arg, SimRegArg):
-                    # FIXME: implement reg_offset handling in SimRegArg
-                    reg_offset = self.arch.registers[arg.reg_name][0]
-                    reg_atom = Register(reg_offset, self.arch.bytes)
-                    reg_def = Definition(reg_atom, ExternalCodeLocation(), tags={ParameterTag()})
-                    reg = self.annotate_with_def(self.top(self.arch.bits), reg_def)
-                    self.register_definitions.store(reg_offset, reg)
-
-                # initialize stack parameters
-                elif isinstance(arg, SimStackArg):
-                    ml_atom = MemoryLocation(SpOffset(self.arch.bits, arg.stack_offset), arg.size)
-                    ml_def = Definition(ml_atom, ExternalCodeLocation(), tags={ParameterTag()})
-                    ml = self.annotate_with_def(self.top(self.arch.bits), ml_def)
-                    self.stack_definitions.store(self._initial_stack_pointer() + arg.stack_offset, ml,
-                                                 endness=self.arch.memory_endness)
-
-                else:
-                    raise TypeError('Unsupported parameter type %s.' % type(arg).__name__)
+                        # initialize stack parameters
+                        elif isinstance(arg, SimStackArg):
+                            ml_atom = MemoryLocation(SpOffset(self.arch.bits, arg.stack_offset), arg.size)
+                            ml_def = Definition(ml_atom, ExternalCodeLocation(),
+                                                tags={ParameterTag(function=func_addr)})
+                            ml = self.annotate_with_def(self.top(self.arch.bits), ml_def)
+                            stack_address = self.get_stack_address(self.stack_address(arg.stack_offset))
+                            self.stack_definitions.store(stack_address, ml,
+                                                         endness=self.arch.memory_endness)
+                        else:
+                            raise TypeError('Unsupported parameter type %s.' % type(arg).__name__)
 
         # architecture dependent initialization
         if self.arch.name.startswith("PPC64"):
@@ -289,6 +298,8 @@ class ReachingDefinitionsState:
             self.arch,
             self._subject,
             track_tmps=self._track_tmps,
+            track_calls=self._track_calls,
+            track_consts=self._track_consts,
             analysis=self.analysis,
             live_definitions=self.live_definitions.copy(),
             canonical_size=self._canonical_size,
@@ -395,17 +406,17 @@ class ReachingDefinitionsState:
 
         return mv
 
-    def add_use(self, atom: Atom, code_loc) -> None:
+    def add_use(self, atom: Atom, code_loc: CodeLocation, expr: Optional[Any]=None) -> None:
         self._cycle(code_loc)
         self.codeloc_uses.update(self.get_definitions(atom))
 
-        self.live_definitions.add_use(atom, code_loc)
+        self.live_definitions.add_use(atom, code_loc, expr=expr)
 
-    def add_use_by_def(self, definition: Definition, code_loc: CodeLocation) -> None:
+    def add_use_by_def(self, definition: Definition, code_loc: CodeLocation, expr: Optional[Any]=None) -> None:
         self._cycle(code_loc)
         self.codeloc_uses.add(definition)
 
-        self.live_definitions.add_use_by_def(definition, code_loc)
+        self.live_definitions.add_use_by_def(definition, code_loc, expr=expr)
 
     def get_definitions(self, atom: Atom) -> Iterable[Definition]:
         yield from self.live_definitions.get_definitions(atom)
@@ -416,5 +427,30 @@ class ReachingDefinitionsState:
         kinda_definition = Definition(atom, code_loc)
 
         if self.dep_graph is not None:
+            self.dep_graph.add_node(kinda_definition)
             for used in self.codeloc_uses:
                 self.dep_graph.add_edge(used, kinda_definition)
+
+    def mark_call(self, code_loc: CodeLocation, target):
+        self._cycle(code_loc)
+        atom = FunctionCall(target, code_loc)
+        kinda_definition = Definition(atom, code_loc)
+
+        if self.dep_graph is not None and self._track_calls:
+            self.dep_graph.add_node(kinda_definition)
+            for used in self.codeloc_uses:
+                self.dep_graph.add_edge(used, kinda_definition)
+            self.codeloc_uses.clear()
+            self.codeloc_uses.add(kinda_definition)
+            self.live_definitions.uses_by_codeloc[code_loc].clear()
+            self.live_definitions.uses_by_codeloc[code_loc].add(kinda_definition)
+
+    def mark_const(self, code_loc: CodeLocation, const):
+        self._cycle(code_loc)
+        atom = ConstantSrc(const)
+        kinda_definition = Definition(atom, code_loc)
+
+        if self.dep_graph is not None and self._track_consts:
+            self.dep_graph.add_node(kinda_definition)
+            self.codeloc_uses.add(kinda_definition)
+            self.live_definitions.uses_by_codeloc[code_loc].add(kinda_definition)

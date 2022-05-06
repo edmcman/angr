@@ -4,13 +4,14 @@ import logging
 
 import pyvex
 import claripy
+from cle import Symbol
 
 from ...storage.memory_mixins.paged_memory.pages.multi_values import MultiValues
 from ...engines.light import SimEngineLight, SimEngineLightVEXMixin, SpOffset
 from ...engines.vex.claripy.datalayer import value as claripy_value
 from ...engines.vex.claripy.irop import operations as vex_operations
 from ...errors import SimEngineError, SimMemoryMissingError
-from ...calling_conventions import DEFAULT_CC, SimRegArg, SimStackArg, SimCC
+from ...calling_conventions import DEFAULT_CC, SimRegArg, SimStackArg, SimCC, SimStructArg, SimArrayArg
 from ...utils.constants import DEFAULT_STATEMENT
 from ...knowledge_plugins.key_definitions.definition import Definition
 from ...knowledge_plugins.key_definitions.tag import LocalVariableTag, ParameterTag, ReturnValueTag, Tag
@@ -24,6 +25,7 @@ from .external_codeloc import ExternalCodeLocation
 
 if TYPE_CHECKING:
     from ...knowledge_plugins import FunctionManager
+    from .function_handler import FunctionHandler
 
 
 l = logging.getLogger(name=__name__)
@@ -44,7 +46,7 @@ class SimEngineRDVEX(
         self._call_stack = call_stack
         self._maximum_local_call_depth = maximum_local_call_depth
         self.functions: Optional['FunctionManager'] = functions
-        self._function_handler = function_handler
+        self._function_handler: Optional["FunctionHandler"] = function_handler
         self._visited_blocks = None
         self._dep_graph = None
 
@@ -203,15 +205,13 @@ class SimEngineRDVEX(
                     tags = None
                 elif self.state.is_stack_address(a):
                     atom = MemoryLocation(SpOffset(self.arch.bits, self.state.get_stack_offset(a)), size)
-                    function_address = (
-                        self.project.kb
-                            .cfgs.get_most_accurate()
-                            .get_all_nodes(self._codeloc().ins_addr, anyaddr=True)[0]
-                            .function_address
-                    )
+                    function_address = None  # we cannot get the function address in the middle of a store if a CFG
+                                             # does not exist. you should backpatch the function address later using
+                                             # the 'ins_addr' metadata entry.
                     tags = {LocalVariableTag(
                         function=function_address,
-                        metadata={'tagged_by': 'SimEngineRDVEX._store_core'}
+                        metadata={'tagged_by': 'SimEngineRDVEX._store_core',
+                                  'ins_addr': self.ins_addr}
                     )}
 
                 elif self.state.is_heap_address(a):
@@ -426,14 +426,14 @@ class SimEngineRDVEX(
     def _handle_ITE(self, expr: pyvex.IRExpr.ITE):
         cond = self._expr(expr.cond)
         cond_v = cond.one_value()
+        iftrue = self._expr(expr.iftrue)
+        iffalse = self._expr(expr.iffalse)
 
         if claripy.is_true(cond_v):
-            return self._expr(expr.iftrue)
+            return iftrue
         elif claripy.is_false(cond_v):
-            return self._expr(expr.iffalse)
+            return iffalse
         else:
-            iftrue = self._expr(expr.iftrue)
-            iffalse = self._expr(expr.iffalse)
             data = iftrue.merge(iffalse)
             return data
 
@@ -459,7 +459,10 @@ class SimEngineRDVEX(
                 if bits > v.size():
                     data.add(v.zero_extend(bits - v.size()))
                 else:
-                    data.add(v[bits - 1:0])
+                    if isinstance(v, claripy.ast.fp.FP):
+                        data.add(v.val_to_bv(bits))
+                    else:
+                        data.add(v[bits - 1:0])
             r = MultiValues(offset_to_values={next(iter(arg_0.values.keys())): data})
 
         else:
@@ -492,9 +495,36 @@ class SimEngineRDVEX(
 
         return MultiValues(offset_to_values={0: {self.state.top(bits)}})
 
+    def _handle_Clz(self, expr):
+        arg0 = expr.args[0]
+        _ = self._expr(arg0)
+        bits = expr.result_size(self.tyenv)
+        # Need to actually implement this later
+        return MultiValues(offset_to_values={0: {self.state.top(bits)}})
+
+    def _handle_Ctz(self, expr):
+        arg0 = expr.args[0]
+        _ = self._expr(arg0)
+        bits = expr.result_size(self.tyenv)
+        # Need to actually implement this later
+        return MultiValues(offset_to_values={0: {self.state.top(bits)}})
+
     #
     # Binary operation handlers
     #
+    def _handle_ExpCmpNE64(self, expr):
+        _, _ = self._expr(expr.args[0]), self._expr(expr.args[1])
+        bits = expr.result_size(self.tyenv)
+        # Need to actually implement this later
+        r = MultiValues(offset_to_values={0: {self.state.top(bits)}})
+        return r
+
+    def _handle_16HLto32(self, expr):
+        _, _ = self._expr(expr.args[0]), self._expr(expr.args[1])
+        bits = expr.result_size(self.tyenv)
+        # Need to actually implement this later
+        r = MultiValues(offset_to_values={0: {self.state.top(bits)}})
+        return r
 
     def _handle_Add(self, expr):
         expr0, expr1 = self._expr(expr.args[0]), self._expr(expr.args[1])
@@ -510,12 +540,13 @@ class SimEngineRDVEX(
         elif expr0_v is None and expr1_v is not None:
             # adding a single value to a multivalue
             if len(expr0.values) == 1 and 0 in expr0.values:
-                vs = {v + expr1_v for v in expr0.values[0]}
+
+                vs = {v.sign_extend(expr1_v.size() - v.size()) + expr1_v for v in expr0.values[0]}
                 r = MultiValues(offset_to_values={0: vs})
         elif expr0_v is not None and expr1_v is None:
             # adding a single value to a multivalue
             if len(expr1.values) == 1 and 0 in expr1.values:
-                vs = {v + expr0_v for v in expr1.values[0]}
+                vs = {v.sign_extend(expr0_v.size() - v.size()) + expr0_v for v in expr1.values[0]}
                 r = MultiValues(offset_to_values={0: vs})
         else:
             # adding two single values together
@@ -586,6 +617,11 @@ class SimEngineRDVEX(
 
         return r
 
+    def _handle_Mull(self, expr):
+        _, _ = self._expr(expr.args[0]), self._expr(expr.args[1])
+        bits = expr.result_size(self.tyenv)
+        return MultiValues(offset_to_values={0: {self.state.top(bits)}})
+
     def _handle_Div(self, expr):
         expr0, expr1 = self._expr(expr.args[0]), self._expr(expr.args[1])
         bits = expr.result_size(self.tyenv)
@@ -608,7 +644,10 @@ class SimEngineRDVEX(
         else:
             if expr0_v.concrete and expr1_v.concrete:
                 # dividing two single values
-                r = MultiValues(offset_to_values={0: {expr0_v / expr1_v}})
+                if expr1_v._model_concrete.value == 0:
+                    r = MultiValues(offset_to_values={0: {self.state.top(bits)}})
+                else:
+                    r = MultiValues(offset_to_values={0: {expr0_v / expr1_v}})
 
         if r is None:
             r = MultiValues(offset_to_values={0: {self.state.top(bits)}})
@@ -668,12 +707,12 @@ class SimEngineRDVEX(
         elif expr0_v is None and expr1_v is not None:
             # bitwise-xor a single value with a multivalue
             if len(expr0.values) == 1 and 0 in expr0.values:
-                vs = {v ^ expr1_v for v in expr0.values[0]}
+                vs = {v.sign_extend(expr1_v.size() - v.size()) ^ expr1_v for v in expr0.values[0]}
                 r = MultiValues(offset_to_values={0: vs})
         elif expr0_v is not None and expr1_v is None:
             # bitwise-xor a single value to a multivalue
             if len(expr1.values) == 1 and 0 in expr1.values:
-                vs = {v ^ expr0_v for v in expr1.values[0]}
+                vs = {v.sign_extend(expr0_v.size() - v.size()) ^ expr0_v for v in expr1.values[0]}
                 r = MultiValues(offset_to_values={0: vs})
         else:
             if expr0_v.concrete and expr1_v.concrete:
@@ -948,102 +987,76 @@ class SimEngineRDVEX(
 
         if func_addr is None:
             l.warning('Invalid type %s for IP.', type(func_addr).__name__)
-            handler_name = 'handle_unknown_call'
-            if hasattr(self._function_handler, handler_name):
-                executed_rda, state = getattr(self._function_handler, handler_name)(
-                    self.state,
-                    src_codeloc=self._codeloc(),
-                )
-                state: ReachingDefinitionsState
-                self.state = state
-            else:
-                l.warning('Please implement the unknown function handler with your own logic.')
+            _, state = self._function_handler.handle_unknown_call(
+                self.state,
+                src_codeloc=self._codeloc(),
+            )
+            self.state = state
             return False
 
         func_addr_v = func_addr.one_value()
         if func_addr_v is None or self.state.is_top(func_addr_v):
             # probably an indirect call
-            handler_name = 'handle_indirect_call'
-            if hasattr(self._function_handler, handler_name):
-                _, state = getattr(self._function_handler, handler_name)(self.state, src_codeloc=self._codeloc())
-                self.state = state
-            else:
-                l.warning('Please implement the indirect function handler with your own logic.')
+            _, state = self._function_handler.handle_indirect_call(self.state, src_codeloc=self._codeloc())
+            self.state = state
             return False
 
         if not func_addr_v.concrete:
-            handler_name = 'handle_unknown_call'
-            if hasattr(self._function_handler, handler_name):
-                executed_rda, state = getattr(self._function_handler, handler_name)(self.state,
+            try:
+                executed_rda, state = self._function_handler.handle_unknown_call(self.state,
                                                                                     src_codeloc=self._codeloc())
                 state: ReachingDefinitionsState
                 self.state = state
-            else:
+            except NotImplementedError:
                 l.warning('Please implement the unknown function handler with your own logic.')
             return False
 
         func_addr_int: int = func_addr_v._model_concrete.value
 
         # direct calls
-        ext_func_name = None
+        symbol: Optional[Symbol] = None
         if not self.project.loader.main_object.contains_addr(func_addr_int):
             is_internal = False
             symbol = self.project.loader.find_symbol(func_addr_int)
-            if symbol is not None:
-                ext_func_name = symbol.name
         else:
             is_internal = True
 
         executed_rda = False
-        if ext_func_name is not None:
-            handler_name = 'handle_%s' % ext_func_name
-            if hasattr(self._function_handler, handler_name):
-                codeloc = CodeLocation(func_addr_int, 0, None, func_addr_int, context=self._context)
-                executed_rda, state = getattr(self._function_handler, handler_name)(self.state, codeloc)
-                self.state = state
-            else:
-                l.warning('Please implement the external function handler for %s() with your own logic.',
-                          ext_func_name)
-                handler_name = 'handle_external_function_fallback'
-                if hasattr(self._function_handler, handler_name):
-                    executed_rda, state = getattr(self._function_handler, handler_name)(self.state, self._codeloc())
-                    self.state = state
+        if symbol is not None:
+            codeloc = CodeLocation(func_addr_int, 0, None, func_addr_int, context=self._context)
+            executed_rda, state = self._function_handler.handle_external_function_symbol(self.state, symbol=symbol, src_codeloc=codeloc)
+            self.state = state
+
         elif is_internal is True:
-            handler_name = 'handle_local_function'
-            if hasattr(self._function_handler, handler_name):
-                codeloc = CodeLocation(func_addr_int, 0, None, func_addr_int, context=self._context)
-                executed_rda, state, visited_blocks, dep_graph = getattr(self._function_handler, handler_name)(
-                    self.state,
-                    func_addr_int,
-                    self._call_stack,
-                    self._maximum_local_call_depth,
-                    self._visited_blocks,
-                    self._dep_graph,
-                    src_ins_addr=self.ins_addr,
-                    codeloc=codeloc,
-                )
-                if executed_rda:
-                    # update everything
-                    self.state = state
-                    self._visited_blocks = visited_blocks
-                    self._dep_graph = dep_graph
-            else:
-                l.warning('Please implement the local function handler with your own logic.')
-        else:
-            l.warning('Could not find function name for external function at address %#x.', func_addr_int)
-            handler_name = 'handle_unknown_call'
-            if hasattr(self._function_handler, handler_name):
-                executed_rda, state = getattr(self._function_handler, handler_name)(self.state,
-                                                                                    src_codeloc=self._codeloc())
+            codeloc = CodeLocation(func_addr_int, 0, None, func_addr_int, context=self._context)
+            executed_rda, state, visited_blocks, dep_graph = self._function_handler.handle_local_function(
+                self.state,
+                func_addr_int,
+                self._call_stack,
+                self._maximum_local_call_depth,
+                self._visited_blocks,
+                self._dep_graph,
+                src_ins_addr=self.ins_addr,
+                codeloc=codeloc,
+            )
+            if executed_rda:
+                # update everything
                 self.state = state
-            else:
-                l.warning('Please implement the unknown function handler with your own logic.')
+                self._visited_blocks = visited_blocks
+                self._dep_graph = dep_graph
+
+        else:
+            l.error('Could not find symbol for external function at address %#x.', func_addr_int)
+            executed_rda, state = self._function_handler.handle_unknown_call(self.state,
+                                                                                src_codeloc=self._codeloc())
+            self.state = state
         skip_cc = executed_rda
 
         return skip_cc
 
     def _handle_function_cc(self, func_addr: Optional[MultiValues]):
         _cc = None
+        proto = None
         func_addr_int: Optional[Union[int,Undefined]] = None
         if func_addr is not None and self.functions is not None:
             func_addr_v = func_addr.one_value()
@@ -1051,6 +1064,7 @@ class SimEngineRDVEX(
                 func_addr_int = func_addr_v._model_concrete.value
                 if self.functions.contains_addr(func_addr_int):
                     _cc = self.functions[func_addr_int].calling_convention
+                    proto = self.functions[func_addr_int].prototype
 
         cc: SimCC = _cc or DEFAULT_CC.get(self.arch.name, None)(self.arch)
 
@@ -1058,20 +1072,66 @@ class SimEngineRDVEX(
         # - add uses for arguments
         # - kill return value registers
         # - caller-saving registers
-        if cc.args:
+        atom: Atom
+        if proto and proto.args:
             code_loc = self._codeloc()
-            for arg in cc.args:
+            for arg in cc.arg_locs(proto):
                 if isinstance(arg, SimRegArg):
                     reg_offset, reg_size = self.arch.registers[arg.reg_name]
                     atom = Register(reg_offset, reg_size)
+                    self.state.add_use(atom, code_loc)
+                    self._tag_definitions_of_atom(atom, func_addr_int)
                 elif isinstance(arg, SimStackArg):
                     atom = MemoryLocation(SpOffset(self.arch.bits,
                                           arg.stack_offset),
                                           arg.size * self.arch.byte_width)
+                    self.state.add_use(atom, code_loc)
+                    self._tag_definitions_of_atom(atom, func_addr_int)
+                elif isinstance(arg, SimStructArg):
+                    min_stack_offset = None
+                    for subargfield, subargloc in arg.locs.items():
+                        if not isinstance(subargloc, SimStackArg):
+                            raise TypeError(f"Unexpected: Field {subargfield} in {arg} is not a stack location.")
+                        if min_stack_offset is None:
+                            min_stack_offset = subargloc.stack_offset
+                        elif min_stack_offset > subargloc.stack_offset:
+                            min_stack_offset = subargloc.stack_offset
+
+                    if min_stack_offset is not None:
+                        atom = MemoryLocation(SpOffset(self.arch.bits,
+                                              min_stack_offset),
+                                              arg.size * self.arch.byte_width)
+                        self.state.add_use(atom, code_loc)
+                        self._tag_definitions_of_atom(atom, func_addr_int)
+                elif isinstance(arg, SimArrayArg):
+                    min_stack_offset = None
+                    max_stack_loc = None
+                    for subargloc in arg.locs:
+                        if isinstance(subargloc, SimRegArg):
+                            atom = Register(subargloc.reg_offset, subargloc.size)
+                            self.state.add_use(atom, code_loc)
+                            self._tag_definitions_of_atom(atom, func_addr_int)
+                        elif isinstance(subargloc, SimStackArg):
+                            if min_stack_offset is None:
+                                min_stack_offset = subargloc.stack_offset
+                            elif min_stack_offset > subargloc.stack_offset:
+                                min_stack_offset = subargloc.stack_offset
+                            if max_stack_loc is None:
+                                max_stack_loc = subargloc.stack_offset + subargloc.size
+                            elif max_stack_loc < subargloc.stack_offset + subargloc.size:
+                                max_stack_loc = subargloc.stack_offset + subargloc.size
+                        else:
+                            raise TypeError("Unsupported argument type %s" % type(subargloc))
+
+                    if min_stack_offset is not None:
+                        atom = MemoryLocation(SpOffset(self.arch.bits,
+                                              min_stack_offset),
+                                              max_stack_loc - min_stack_offset)
+                        self.state.add_use(atom, code_loc)
+                        self._tag_definitions_of_atom(atom, func_addr_int)
                 else:
                     raise TypeError("Unsupported argument type %s" % type(arg))
-                self.state.add_use(atom, code_loc)
-                self._tag_definitions_of_atom(atom, func_addr_int)
+
 
         if cc.RETURN_VAL is not None:
             if isinstance(cc.RETURN_VAL, SimRegArg):
@@ -1094,7 +1154,8 @@ class SimEngineRDVEX(
                 atom = Register(reg_offset, reg_size)
                 self.state.kill_and_add_definition(atom,
                                                    self._codeloc(),
-                                                   MultiValues(offset_to_values={0: {self.state.top(reg_size * self.arch.byte_width)}}),
+                                                   MultiValues(offset_to_values=
+                                                               {0: {self.state.top(reg_size * self.arch.byte_width)}}),
                                                    )
 
         if self.arch.call_pushes_ret is True:

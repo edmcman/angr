@@ -1,4 +1,5 @@
 from enum import Enum
+from typing import Union
 
 import ailment
 
@@ -14,6 +15,7 @@ class SubjectType(Enum):
 
 
 class Subject:
+    _visitor: Union[FunctionGraphVisitor, SingleNodeGraphVisitor]
     def __init__(self, content, func_graph=None, cc=None):
         """
         The thing being analysed, and the way (visitor) to analyse it.
@@ -27,7 +29,7 @@ class Subject:
         self._content = content
 
         if isinstance(content, Function):
-            self._cc = cc
+            self._cc = cc or content.calling_convention
             self._func_graph = func_graph
             self._type = SubjectType.Function
             self._visitor = FunctionGraphVisitor(content, func_graph)
@@ -58,5 +60,5 @@ class Subject:
         return self._type
 
     @property
-    def visitor(self):
+    def visitor(self) -> Union[FunctionGraphVisitor, SingleNodeGraphVisitor]:
         return self._visitor

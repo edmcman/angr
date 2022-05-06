@@ -12,7 +12,8 @@ from claripy.utils.orderedset import OrderedSet
 from ...protos import variables_pb2
 from ...serializable import Serializable
 from ...sim_variable import SimVariable, SimStackVariable, SimMemoryVariable, SimRegisterVariable
-from ...sim_type import TypeRef, SimType, SimStruct, SimTypePointer
+from ...sim_type import TypeRef, SimType, SimStruct, SimTypePointer, SimTypeBottom, SimTypeChar, SimTypeShort, \
+    SimTypeInt, SimTypeLong
 from ...keyed_region import KeyedRegion
 from ..plugin import KnowledgeBasePlugin
 from ..types import TypesStore
@@ -65,7 +66,6 @@ class VariableManagerInternal(Serializable):
 
         self._variable_accesses: Dict[SimVariable,Set[VariableAccess]] = defaultdict(set)
         self._insn_to_variable: Dict[int,Set[Tuple[SimVariable,int]]] = defaultdict(set)
-        self._block_to_variable: Dict[int,Set[Tuple[SimVariable,int]]] = defaultdict(set)
         self._stmt_to_variable: Dict[Tuple[int,int],Set[Tuple[SimVariable,int]]] = defaultdict(set)
         self._atom_to_variable: Dict[Tuple[int,int],Dict[int,Set[Tuple[SimVariable,int]]]] = \
             defaultdict(_defaultdict_set)
@@ -90,6 +90,19 @@ class VariableManagerInternal(Serializable):
     #
     # Serialization
     #
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+
+    def __getstate__(self):
+        d = dict(self.__dict__)
+        d['manager'] = None
+        d['types'].kb = None
+        return d
+
+    def set_manager(self, manager: 'VariableManager'):
+        self.manager = manager
+        self.types.kb = manager._kb
 
     @classmethod
     def _get_cmsg(cls):
@@ -187,7 +200,6 @@ class VariableManagerInternal(Serializable):
 
             model._variable_accesses[variable_access.variable].add(variable_access)
             model._insn_to_variable[variable_access.location.ins_addr].add(tpl)
-            model._block_to_variable[variable_access.location.block_addr].add(tpl)
             loc = (variable_access.location.block_addr, variable_access.location.stmt_idx)
             model._stmt_to_variable[loc].add(tpl)
             if variable_access.atom_hash is not None:
@@ -298,14 +310,12 @@ class VariableManagerInternal(Serializable):
         if overwrite:
             self._variable_accesses[variable] = {VariableAccess(variable, sort, location, offset, atom_hash=atom_hash)}
             self._insn_to_variable[location.ins_addr] = {var_and_offset}
-            self._block_to_variable[location.block_addr] = {var_and_offset}
             self._stmt_to_variable[(location.block_addr, location.stmt_idx)] = {var_and_offset}
             if atom_hash is not None:
                 self._atom_to_variable[(location.block_addr, location.stmt_idx)][atom_hash] = { var_and_offset }
         else:
             self._variable_accesses[variable].add(VariableAccess(variable, sort, location, offset, atom_hash=atom_hash))
             self._insn_to_variable[location.ins_addr].add(var_and_offset)
-            self._block_to_variable[location.block_addr].add(var_and_offset)
             self._stmt_to_variable[(location.block_addr, location.stmt_idx)].add(var_and_offset)
             if atom_hash is not None:
                 self._atom_to_variable[(location.block_addr, location.stmt_idx)][atom_hash].add(var_and_offset)
@@ -328,13 +338,13 @@ class VariableManagerInternal(Serializable):
                 non_phis.add(var)
         if len(existing_phis) == 1:
             existing_phi = next(iter(existing_phis))
-            if non_phis.issubset(self.get_phi_subvariables(existing_phi)):
-                return existing_phi
-            else:
-                # Update phi variables
-                self._phi_variables[existing_phi] |= non_phis
+            if block_addr in self._phi_variables_by_block and existing_phi in self._phi_variables_by_block[block_addr]:
+                if not non_phis.issubset(self.get_phi_subvariables(existing_phi)):
+                    # Update the variables that this phi variable represents
+                    self._phi_variables[existing_phi] |= non_phis
                 return existing_phi
 
+        # allocate a new phi variable
         repre = next(iter(variables))
         repre_type = type(repre)
         if repre_type is SimRegisterVariable:
@@ -416,6 +426,9 @@ class VariableManagerInternal(Serializable):
             return set()
 
         return self._atom_to_variable[key][atom_hash]
+
+    def find_variables_by_stack_offset(self, offset: int) -> Set[SimVariable]:
+        return self._stack_region.get_variables_by_offset(offset)
 
     def get_variable_accesses(self, variable: SimVariable, same_name: bool=False) -> List[VariableAccess]:
 
@@ -506,7 +519,7 @@ class VariableManagerInternal(Serializable):
         """
 
         if block_addr not in self._phi_variables_by_block:
-            return dict()
+            return { }
         variables = { }
         for phi in self._phi_variables_by_block[block_addr]:
             variables[phi] = self._phi_variables[phi]
@@ -652,7 +665,20 @@ class VariableManagerInternal(Serializable):
         self.types[name] = ty
         return ty
 
-    def set_variable_type(self, var: SimVariable, ty: SimType, name: Optional[str]=None) -> None:
+    def set_variable_type(self, var: SimVariable, ty: SimType, name: Optional[str]=None,
+                          override_bot: bool=True) -> None:
+        if isinstance(ty, SimTypeBottom) and override_bot:
+            # we fall back to assigning a default unsigned integer type for the variable
+            if var.size is not None:
+                size_to_type = {
+                    1: SimTypeChar,
+                    2: SimTypeShort,
+                    4: SimTypeInt,
+                    8: SimTypeLong,
+                }
+                if var.size in size_to_type:
+                    ty = size_to_type[var.size](signed=False, label=ty.label).with_arch(self.manager._kb._project.arch)
+
         if name:
             if name not in self.types:
                 self.types[name] = TypeRef(name, ty).with_arch(self.manager._kb._project.arch)
@@ -663,6 +689,7 @@ class VariableManagerInternal(Serializable):
             ty.pts_to = typeref
         elif isinstance(ty, SimStruct):
             ty = self._register_struct_type(ty, name=name)
+
         self.variable_to_types[var] = ty
 
     def get_variable_type(self, var) -> Optional[SimType]:
@@ -700,11 +727,20 @@ class VariableManagerInternal(Serializable):
         for v, subvs in self._phi_variables.items():
             if not isinstance(v, SimRegisterVariable):
                 continue
-            if not self.get_variable_accesses(v):
-                # this phi node has never been used - discard it
-                continue
             for subv in subvs:
                 graph.add_edge(v, subv)
+
+        # prune the graph: remove nodes that have never been used
+        while True:
+            unused_nodes = set()
+            for node in [ nn for nn in graph.nodes() if graph.degree[nn] == 1]:
+                if not self.get_variable_accesses(node):
+                    # this node has never been used - discard it
+                    unused_nodes.add(node)
+            if unused_nodes:
+                graph.remove_nodes_from(unused_nodes)
+            else:
+                break
 
         for nodes in networkx.connected_components(graph):
             if len(nodes) <= 1:
