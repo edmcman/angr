@@ -278,7 +278,7 @@ def test_jumptable_occupied_as_data():
 
     # 40 bytes starting at 0x402e4d should be marked as "data"
     for addr in range(0x402e54, 0x402e54 + 40, 4):
-        assert cfg._seg_list.occupied_by_sort(addr) == "data"
+        assert cfg._seg_list.occupied_by_sort(addr) == "pointer-array"
 
     # node 0x402e4d should have 10 successors
     assert len(cfg.model.get_any_node(0x402e4d).successors) == 10
@@ -299,7 +299,7 @@ def test_vtable_amd64_libc_ubuntu_2004():
     assert ij.type == IndirectJumpType.Vtable
     assert len(ij.jumptable_entries) == 213
 
-    # all non-zere entries in a vtable should be made functions
+    # all non-zero entries in a vtable should be made functions
     for entry in ij.jumptable_entries:
         if entry != 0:
             assert entry in cfg.functions

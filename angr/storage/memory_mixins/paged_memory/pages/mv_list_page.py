@@ -1,4 +1,4 @@
-# pylint:disable=abstract-method
+# pylint:disable=abstract-method,arguments-differ
 import logging
 from typing import Optional, List, Set, Tuple, Union, Callable
 
@@ -78,8 +78,12 @@ class MVListPage(
         global_end_addr = addr + page_addr
         global_start_addr = result[-1][0]
         size = global_end_addr - global_start_addr
-        new_ast = self._default_value(global_start_addr, size, name='%s_%x' % (memory.id, global_start_addr),
-                                      key=(self.category, global_start_addr), memory=memory, **kwargs)
+        new_ast = self._default_value(global_start_addr,
+                                      size,
+                                      name='%s_%x' % (memory.id, global_start_addr),
+                                      key=(self.category, global_start_addr),
+                                      memory=memory,
+                                      **kwargs)
         new_item = SimMemoryObject(new_ast, global_start_addr, endness=endness,
                                    byte_width=memory.state.arch.byte_width if memory is not None else 8)
         subaddr_start = global_start_addr - page_addr
@@ -89,6 +93,8 @@ class MVListPage(
         result[-1] = (global_start_addr, new_item)
 
     def store(self, addr, data, size=None, endness=None, memory=None, cooperate=False, weak=False, **kwargs):
+        super().store(addr, data, size=size, endness=endness, memory=memory, cooperate=cooperate, weak=weak, **kwargs)
+
         if not cooperate:
             data = self._force_store_cooperation(addr, data, size, endness, memory=memory, **kwargs)
 
@@ -164,7 +170,7 @@ class MVListPage(
             mo_lengths = set(mo.length for mo, _ in memory_objects)
             endnesses = set(mo.endness for mo in mos)
 
-            if not unconstrained_in and not (mos - merged_objects):
+            if not unconstrained_in and not (mos - merged_objects):  # pylint:disable=superfluous-parens
                 continue
 
             # first, optimize the case where we are dealing with the same-sized memory objects
@@ -175,7 +181,7 @@ class MVListPage(
                 # Update `merged_to`
                 mo_base = list(mo_bases)[0]
                 mo_length = memory_objects[0][0].length
-                size = mo_length - (page_addr + b - mo_base)
+                size = min(mo_length - (page_addr + b - mo_base), len(self.content) - b)
                 merged_to = b + size
 
                 merged_val = self._merge_values(to_merge, mo_length, memory=memory)
@@ -202,7 +208,8 @@ class MVListPage(
             else:
                 # get the size that we can merge easily. This is the minimum of
                 # the size of all memory objects and unallocated spaces.
-                min_size = min([mo.length - (b + page_addr - mo.base) for mo, _ in memory_objects])
+                min_size = min([mo.length - (b + page_addr - mo.base)
+                                for mo, _ in memory_objects] + [len(self.content) - b])
                 for um, _ in unconstrained_in:
                     for i in range(0, min_size):
                         if um._contains(b + i, page_addr):
@@ -245,21 +252,23 @@ class MVListPage(
         return merged_offsets
 
     def changed_bytes(self, other: 'MVListPage', page_addr: int = None):
+        candidates: Set[int] = super().changed_bytes(other)
+        if candidates is None:
+            candidates: Set[int] = set()
+            # resort to the slower solution
+            if self.sinkhole is None:
+                candidates |= self.stored_offset
+            else:
+                for i in range(len(self.content)):
+                    if self._contains(i, page_addr):
+                        candidates.add(i)
 
-        candidates: Set[int] = set()
-        if self.sinkhole is None:
-            candidates |= self.stored_offset
-        else:
-            for i in range(len(self.content)):
-                if self._contains(i, page_addr):
-                    candidates.add(i)
-
-        if other.sinkhole is None:
-            candidates |= other.stored_offset
-        else:
-            for i in range(len(other.content)):
-                if other._contains(i, page_addr):
-                    candidates.add(i)
+            if other.sinkhole is None:
+                candidates |= other.stored_offset
+            else:
+                for i in range(len(other.content)):
+                    if other._contains(i, page_addr):
+                        candidates.add(i)
 
         byte_width = 8  # TODO: Introduce self.state if we want to use self.state.arch.byte_width
         differences: Set[int] = set()

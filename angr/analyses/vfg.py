@@ -1,3 +1,4 @@
+from typing import List, Generator, TYPE_CHECKING
 import logging
 from collections import defaultdict
 
@@ -5,7 +6,7 @@ import archinfo
 from archinfo.arch_arm import is_arm_arch
 import claripy
 import networkx
-from . import Analysis
+from . import Analysis, CFGEmulated
 
 from .cfg.cfg_job_base import BlockID, FunctionKey, CFGJobBase
 from .cfg.cfg_utils import CFGUtils
@@ -17,6 +18,10 @@ from ..errors import AngrDelayJobNotice, AngrSkipJobNotice, AngrVFGError, AngrEr
     AngrJobMergingFailureNotice, SimValueError, SimIRSBError, SimError
 from ..procedures import SIM_PROCEDURES
 from ..state_plugins.callstack import CallStack
+
+if TYPE_CHECKING:
+    from angr.sim_state import SimState
+
 
 l = logging.getLogger(name=__name__)
 
@@ -65,7 +70,7 @@ class VFGJob(CFGJobBase):
         return "//".join(s)
 
 
-class PendingJob(object):
+class PendingJob:
 
     __slots__ = ('block_id', 'state', 'call_stack', 'src_block_id', 'src_stmt_idx', 'src_ins_addr', )
 
@@ -78,7 +83,7 @@ class PendingJob(object):
         self.src_ins_addr = src_ins_addr
 
 
-class AnalysisTask(object):
+class AnalysisTask:
     """
     An analysis task describes a task that should be done before popping this task out of the task stack and discard it.
     """
@@ -176,7 +181,7 @@ class CallAnalysis(AnalysisTask):
         return job
 
 
-class VFGNode(object):
+class VFGNode:
     """
     A descriptor of nodes in a Value-Flow Graph
     """
@@ -416,6 +421,11 @@ class VFG(ForwardAnalysis, Analysis):   # pylint:disable=abstract-method
             if n.addr == addr:
                 return n
 
+    def get_all_nodes(self, addr) -> Generator[VFGNode,None,None]:
+        for n in self.graph.nodes():
+            if n.addr == addr:
+                yield n
+
     def irsb_from_node(self, node):
         return self.project.factory.successors(node.state, addr=node.addr)
 
@@ -462,7 +472,8 @@ class VFG(ForwardAnalysis, Analysis):   # pylint:disable=abstract-method
             l.debug("Generating a CFG, since none was given...")
             # TODO: can we use a fast CFG instead? note that fast CFG does not care of context sensitivity at all, but
             # TODO: for state merging, we also don't really care about context sensitivity.
-            self._cfg = self.project.analyses.CFGEmulated(context_sensitivity_level=self._context_sensitivity_level,
+            self._cfg = self.project.analyses[CFGEmulated].prep()(
+                context_sensitivity_level=self._context_sensitivity_level,
                 starts=(self._start,)
             )
 
@@ -669,19 +680,21 @@ class VFG(ForwardAnalysis, Analysis):   # pylint:disable=abstract-method
                              src_exit_stmt_idx=src_exit_stmt_idx
                              )
 
-    def _get_successors(self, job):
+    def _get_successors(self, job: VFGJob):
         # Extract initial values
         state = job.state
         addr = job.addr
 
         # Obtain successors
         if addr not in self._avoid_runs:
-            all_successors = job.sim_successors.flat_successors + job.sim_successors.unconstrained_successors
+            all_successors: List['SimState'] = job.sim_successors.flat_successors + job.sim_successors.unconstrained_successors
         else:
             all_successors = []
 
         # save those states
-        job.vfg_node.final_states = all_successors[:]
+        if job.vfg_node.final_states is None:
+            job.vfg_node.final_states = [ ]
+        job.vfg_node.final_states.extend(all_successors)
 
         # Update thumb_addrs
         if job.sim_successors.sort == 'IRSB' and state.thumb:
@@ -709,7 +722,17 @@ class VFG(ForwardAnalysis, Analysis):   # pylint:disable=abstract-method
         # is artificial) into the CFG. The exits will be Ijk_Call and
         # Ijk_FakeRet, and Ijk_Call always goes first
         job.is_call_jump = any([self._is_call_jumpkind(i.history.jumpkind) for i in all_successors])
-        call_targets = [i.solver.eval_one(i.ip) for i in all_successors if self._is_call_jumpkind(i.history.jumpkind)]
+        call_targets = [ ]
+        for succ in all_successors:
+            if self._is_call_jumpkind(succ.history.jumpkind):
+                try:
+                    call_targets.append(succ.solver.eval_one(succ._ip))
+                    # finding one is enough!
+                    break
+                except SimValueError:
+                    # this call has multiple possible targets. ignore it
+                    pass
+
         job.call_target = None if not call_targets else call_targets[0]
 
         job.is_return_jump = len(all_successors) and all_successors[0].history.jumpkind == 'Ijk_Ret'
@@ -910,7 +933,7 @@ class VFG(ForwardAnalysis, Analysis):   # pylint:disable=abstract-method
 
         return new_jobs
 
-    def _post_job_handling(self, job, new_jobs, successors):  # pylint:disable=unused-argument
+    def _post_job_handling(self, job: VFGJob, new_jobs, successors):  # pylint:disable=unused-argument
 
         # Debugging output
         if l.level == logging.DEBUG:
@@ -1344,23 +1367,20 @@ class VFG(ForwardAnalysis, Analysis):   # pylint:disable=abstract-method
             # does not support. I'll create a terminating stub there
             l.error("SimIRSBError occurred(%s). Creating a PathTerminator.", ex)
             error_occured = True
-            inst = SIM_PROCEDURES["stubs"]["PathTerminator"](
-                state, self.project.arch)
+            inst = SIM_PROCEDURES["stubs"]["PathTerminator"](state)
             sim_successors = ProcedureEngine().process(state, procedure=inst)
         except claripy.ClaripyError:
             l.error("ClaripyError: ", exc_info=True)
             error_occured = True
             # Generate a PathTerminator to terminate the current path
-            inst = SIM_PROCEDURES["stubs"]["PathTerminator"](
-                state, self.project.arch)
+            inst = SIM_PROCEDURES["stubs"]["PathTerminator"](state)
             sim_successors = ProcedureEngine().process(state, procedure=inst)
         except SimError:
             l.error("SimError: ", exc_info=True)
 
             error_occured = True
             # Generate a PathTerminator to terminate the current path
-            inst = SIM_PROCEDURES["stubs"]["PathTerminator"](
-                    state, self.project.arch)
+            inst = SIM_PROCEDURES["stubs"]["PathTerminator"](state)
             sim_successors = ProcedureEngine().process(state, procedure=inst)
         except AngrError as ex:
             #segment = self.project.loader.main_object.in_which_segment(addr)
@@ -1561,7 +1581,7 @@ class VFG(ForwardAnalysis, Analysis):   # pylint:disable=abstract-method
                 l.debug("Removed (%s) from FakeExits dict.",
                         ",".join([hex(i) if i is not None else 'None' for i in tpl]))
 
-    def _post_job_handling_debug(self, job, successors):
+    def _post_job_handling_debug(self, job: VFGJob, successors):
         """
         Print out debugging information after handling a VFGJob and generating the succeeding jobs.
 

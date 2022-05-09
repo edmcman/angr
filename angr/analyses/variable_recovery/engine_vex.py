@@ -1,7 +1,9 @@
+# pylint:disable=unused-argument
 from typing import TYPE_CHECKING
 
 import claripy
 import pyvex
+from archinfo.arch_arm import is_arm_arch
 
 from ...engines.vex.claripy.datalayer import value as claripy_value
 from ...engines.light import SimEngineLightVEXMixin
@@ -16,6 +18,9 @@ class SimEngineVRVEX(
     SimEngineLightVEXMixin,
     SimEngineVRBase,
 ):
+    """
+    Implements the VEX engine for variable recovery analysis.
+    """
     state: 'VariableRecoveryStateBase'
 
     # Statement handlers
@@ -98,6 +103,23 @@ class SimEngineVRVEX(
         reg_offset = expr.offset
         reg_size = expr.result_size(self.tyenv) // 8
 
+        # because of how VEX implements MOVCC and MOVCS instructions in ARM THUMB mode, we need to skip the register
+        # read if the immediate next instruction is an WrTmp(ITE).
+        #
+        # MOVCC           R3, #0
+        #
+        #    46 | ------ IMark(0xfeca2, 2, 1) ------
+        #    47 | t299 = CmpLT32U(t8,0x00010000)
+        #    48 | t143 = GET:I32(r3)      <-   this read does not exist
+        #    49 | t300 = ITE(t299,0x00000000,t143)
+        #    50 | PUT(r3) = t300
+        #    51 | PUT(pc) = 0x000feca5
+        if is_arm_arch(self.arch) and (self.ins_addr & 1) == 1:
+            if self.stmt_idx < len(self.block.vex.statements) - 1:
+                next_stmt = self.block.vex.statements[self.stmt_idx + 1]
+                if isinstance(next_stmt, pyvex.IRStmt.WrTmp) and isinstance(next_stmt.data, pyvex.IRExpr.ITE):
+                    return RichR(self.state.top(reg_size * 8))
+
         return self._read_from_register(reg_offset, reg_size, expr=expr)
 
     def _handle_Load(self, expr: pyvex.IRExpr.Load) -> RichR:
@@ -113,14 +135,14 @@ class SimEngineVRVEX(
     def _handle_Conversion(self, expr: pyvex.IRExpr.Unop) -> RichR:
         return RichR(self.state.top(expr.result_size(self.tyenv)))
 
-
     # Function handlers
 
     def _handle_function(self, func_addr):  # pylint:disable=unused-argument,no-self-use,useless-return
         return None
 
     def _handle_Const(self, expr):
-        return RichR(claripy_value(expr.con.type, expr.con.value), typevar=typeconsts.int_type(expr.con.size))
+        return RichR(claripy_value(expr.con.type, expr.con.value, size=expr.con.size),
+                     typevar=typeconsts.int_type(expr.con.size))
 
     def _handle_Add(self, expr):
         arg0, arg1 = expr.args
@@ -339,6 +361,27 @@ class SimEngineVRVEX(
                      typevar=r0.typevar,
                      )
 
+    def _handle_CmpF(self, expr):
+        return RichR(self.state.top(expr.result_size(self.tyenv)))
+
+    def _handle_16HLto32(self, expr):
+        return RichR(self.state.top(32))
+
+    def _handle_Add_v(self, expr, vector_size, vector_count):
+        return RichR(self.state.top(expr.result_size(self.tyenv)))
+
+    def _handle_QSub_v(self, expr, vector_size, vector_count):
+        return RichR(self.state.top(expr.result_size(self.tyenv)))
+
+    def _handle_HAdd_v(self, expr, vector_size, vector_count):
+        return RichR(self.state.top(expr.result_size(self.tyenv)))
+
+    def _handle_Clz(self, expr):
+        return RichR(self.state.top(expr.result_size(self.tyenv)))
+
+    def _handle_Mull(self, expr):
+        return RichR(self.state.top(expr.result_size(self.tyenv)))
+
     def _handle_CmpEQ(self, expr):
         arg0, arg1 = expr.args
         _ = self._expr(arg0)
@@ -380,3 +423,35 @@ class SimEngineVRVEX(
         _ = self._expr(arg1)
 
         return RichR(self.state.top(1))
+
+    def _handle_Cmp_v(self, expr, vector_size, vector_count):
+        return RichR(self.state.top(1))
+
+    def _handle_ExpCmpNE64(self, expr):
+        _, _ = self._expr(expr.args[0]), self._expr(expr.args[1])
+        return RichR(self.state.top(expr.result_size(self.tyenv)))
+
+    def _handle_Clz(self, expr):
+        arg0 = expr.args[0]
+        expr_0 = self._expr(arg0)
+        if expr_0 is None:
+            return None
+        if self.state.is_top(expr_0.data):
+            return RichR(self.state.top(expr_0.data.size()))
+        return RichR(self.state.top(expr_0.data.size()))
+
+    def _handle_Ctz(self, expr):
+        arg0 = expr.args[0]
+        expr_0 = self._expr(arg0)
+        if expr_0 is None:
+            return None
+        if self.state.is_top(expr_0.data):
+            return RichR(self.state.top(expr_0.data.size()))
+        return RichR(self.state.top(expr_0.data.size()))
+
+    _handle_CmpEQ_v = _handle_Cmp_v
+    _handle_CmpNE_v = _handle_Cmp_v
+    _handle_CmpLE_v = _handle_Cmp_v
+    _handle_CmpLT_v = _handle_Cmp_v
+    _handle_CmpGE_v = _handle_Cmp_v
+    _handle_CmpGT_v = _handle_Cmp_v

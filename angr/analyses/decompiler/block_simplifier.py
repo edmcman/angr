@@ -3,7 +3,7 @@ import logging
 from typing import Optional, Union, Type, Iterable, Tuple, Set, TYPE_CHECKING
 
 from ailment.statement import Statement, Assignment, Call
-from ailment.expression import Expression, Tmp, Register, Load
+from ailment.expression import Expression, Tmp, Load
 
 from ...engines.light.data import SpOffset
 from ...knowledge_plugins.key_definitions.constants import OP_AFTER
@@ -16,7 +16,7 @@ from .ailblock_walker import AILBlockWalker
 
 if TYPE_CHECKING:
     from angr.storage.memory_mixins.paged_memory.pages.multi_values import MultiValues
-    from angr.knowledge_plugins.key_definitions.live_definitions import LiveDefinitions
+    from angr.knowledge_plugins.key_definitions.live_definitions import LiveDefinitions, Definition
     from ailment.block import Block
 
 
@@ -27,8 +27,10 @@ class BlockSimplifier(Analysis):
     """
     Simplify an AIL block.
     """
-    def __init__(self, block: Optional['Block'], remove_dead_memdefs=False, stack_pointer_tracker=None,
-                 peephole_optimizations: Optional[Iterable[Union[Type[PeepholeOptimizationStmtBase],Type[PeepholeOptimizationExprBase]]]]=None,
+    def __init__(self, block: Optional['Block'], func_addr: Optional[int] = None,
+                 remove_dead_memdefs=False, stack_pointer_tracker=None,
+                 peephole_optimizations: Optional[Iterable[Union[Type[PeepholeOptimizationStmtBase],
+                                                                 Type[PeepholeOptimizationExprBase]]]]=None,
                  stack_arg_offsets: Optional[Set[Tuple[int, int]]] = None,
                  ):
         """
@@ -37,18 +39,19 @@ class BlockSimplifier(Analysis):
         """
 
         self.block = block
+        self.func_addr = func_addr
 
         self._remove_dead_memdefs = remove_dead_memdefs
         self._stack_arg_offsets = stack_arg_offsets
         self._stack_pointer_tracker = stack_pointer_tracker
 
         if peephole_optimizations is None:
-            self._expr_peephole_opts = [ cls(self.project) for cls in EXPR_OPTS ]
-            self._stmt_peephole_opts = [ cls(self.project) for cls in STMT_OPTS ]
+            self._expr_peephole_opts = [ cls(self.project, self.kb, self.func_addr) for cls in EXPR_OPTS ]
+            self._stmt_peephole_opts = [ cls(self.project, self.kb, self.func_addr) for cls in STMT_OPTS ]
         else:
-            self._expr_peephole_opts = [ cls(self.project) for cls in peephole_optimizations
+            self._expr_peephole_opts = [ cls(self.project, self.kb, self.func_addr) for cls in peephole_optimizations
                                          if issubclass(cls, PeepholeOptimizationExprBase) ]
-            self._stmt_peephole_opts = [ cls(self.project) for cls in peephole_optimizations
+            self._stmt_peephole_opts = [ cls(self.project, self.kb, self.func_addr) for cls in peephole_optimizations
                                          if issubclass(cls, PeepholeOptimizationStmtBase) ]
 
         self.result_block = None
@@ -96,7 +99,7 @@ class BlockSimplifier(Analysis):
         return new_block
 
     @staticmethod
-    def _replace_and_build(block, replacements) -> Tuple[bool,'Block']:
+    def _replace_and_build(block, replacements, replace_assignment_dsts: bool=False) -> Tuple[bool,'Block']:
 
         new_statements = block.statements[::]
         replaced = False
@@ -117,10 +120,14 @@ class BlockSimplifier(Analysis):
                         # special case: do not replace the ret_expr of a call statement to another call statement
                         r = False
                         new_stmt = None
-                    elif isinstance(stmt, Assignment):
+                    elif isinstance(stmt, Assignment) and not replace_assignment_dsts:
                         # special case: do not replace the dst
                         new_stmt = None
-                        r, new_src = stmt.src.replace(old, new)
+                        if stmt.src == old:
+                            r = True
+                            new_src = new.copy()
+                        else:
+                            r, new_src = stmt.src.replace(old, new)
                         if r:
                             new_stmt = Assignment(stmt.idx, stmt.dst, new_src, **stmt.tags)
                     else:
@@ -167,7 +174,7 @@ class BlockSimplifier(Analysis):
 
         # Find dead assignments
         dead_defs_stmt_idx = set()
-        all_defs = rd.all_definitions
+        all_defs: Iterable['Definition'] = rd.all_definitions
         stackarg_offsets = set(tpl[1] for tpl in self._stack_arg_offsets) \
             if self._stack_arg_offsets is not None else None
         for d in all_defs:
@@ -224,10 +231,6 @@ class BlockSimplifier(Analysis):
 
                 # is it a dead virgin?
                 if idx in dead_defs_stmt_idx:
-                    continue
-
-                # is it an assignment to an artificial register?
-                if type(stmt.dst) is Register and self.project.arch.is_artificial_register(stmt.dst.reg_offset, stmt.dst.size):
                     continue
 
                 if stmt.src == stmt.dst:

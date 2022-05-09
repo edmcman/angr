@@ -1,4 +1,5 @@
 from typing import Optional, List, Tuple, Any, Set, TYPE_CHECKING
+import copy
 import logging
 
 import archinfo
@@ -6,8 +7,8 @@ from ailment import Stmt, Expr
 
 from ...procedures.stubs.format_parser import FormatParser, FormatSpecifier
 from ...errors import SimMemoryMissingError
-from ...sim_type import SimTypeBottom, SimTypePointer, SimTypeChar
-from ...calling_conventions import SimRegArg, SimStackArg
+from ...sim_type import SimTypeBottom, SimTypePointer, SimTypeChar, SimTypeInt
+from ...calling_conventions import SimRegArg, SimStackArg, SimCC
 from ...knowledge_plugins.key_definitions.constants import OP_BEFORE
 from ...knowledge_plugins.key_definitions.definition import Definition
 from .. import Analysis, register_analysis
@@ -65,38 +66,30 @@ class CallSiteMaker(Analysis):
 
             args = [ ]
             arg_locs = None
-            if func.calling_convention is None:
+            if cc is None:
                 l.warning('%s has an unknown calling convention.', repr(func))
             else:
                 stackarg_sp_diff = func.calling_convention.STACKARG_SP_DIFF
-                if func.prototype is not None:
+                if prototype is not None:
                     # Make arguments
-                    arg_locs = func.calling_convention.arg_locs()
-                    if func.prototype.variadic:
+                    arg_locs = cc.arg_locs(prototype)
+                    if prototype.variadic:
                         # determine the number of variadic arguments
-                        variadic_args = self._determine_variadic_arguments(func, func.calling_convention, last_stmt)
+                        variadic_args = self._determine_variadic_arguments(func, cc, last_stmt)
                         if variadic_args:
-                            arg_sizes = [arg.size // self.project.arch.byte_width for arg in func.prototype.args] + \
-                                        ([self.project.arch.bytes] * variadic_args)
-                            is_fp = [False] * len(arg_sizes)
-                            arg_locs = func.calling_convention.arg_locs(is_fp=is_fp, sizes=arg_sizes)
-                else:
-                    if func.calling_convention.args is not None:
-                        arg_locs = func.calling_convention.arg_locs()
+                            callsite_ty = copy.copy(prototype)
+                            callsite_ty.args = list(callsite_ty.args)
+                            for i in range(variadic_args):
+                                callsite_ty.args.append(SimTypeInt().with_arch(self.project.arch))
+                            arg_locs = cc.arg_locs(callsite_ty)
 
             if arg_locs is not None:
                 for arg_loc in arg_locs:
                     if type(arg_loc) is SimRegArg:
                         size = arg_loc.size
-                        offset = arg_loc._fix_offset(None, size, arch=self.project.arch)
-
-                        _, the_arg = self._resolve_register_argument(last_stmt, arg_loc)
-
-                        if the_arg is not None:
-                            args.append(the_arg)
-                        else:
-                            # Reaching definitions are not available. Create a register expression instead.
-                            args.append(Expr.Register(self._atom_idx(), None, offset, size * 8, reg_name=arg_loc.reg_name))
+                        offset = arg_loc.check_offset(cc.arch)
+                        args.append(Expr.Register(self._atom_idx(), None, offset, size * 8,
+                                                  reg_name=arg_loc.reg_name))
                     elif type(arg_loc) is SimStackArg:
 
                         stack_arg_locs.append(arg_loc)
@@ -158,7 +151,17 @@ class CallSiteMaker(Analysis):
         # if ret_expr is None, it means in previous steps (such as during AIL simplification) we have deemed the return
         # value of this call statement as useless and is removed.
 
-        new_stmts.append(Stmt.Call(last_stmt, last_stmt.target,
+        if ret_expr is not None \
+                and prototype is not None \
+                and prototype.returnty is not None \
+                and not isinstance(prototype.returnty, SimTypeBottom):
+            # try to narrow the return expression if needed
+            ret_type_bits = prototype.returnty.with_arch(self.project.arch).size
+            if ret_expr.bits > ret_type_bits:
+                ret_expr = ret_expr.copy()
+                ret_expr.bits = ret_type_bits
+
+        new_stmts.append(Stmt.Call(last_stmt.idx, last_stmt.target,
                                    calling_convention=cc,
                                    prototype=prototype,
                                    args=args,
@@ -194,7 +197,7 @@ class CallSiteMaker(Analysis):
     def _resolve_register_argument(self, call_stmt, arg_loc) -> Tuple:
 
         size = arg_loc.size
-        offset = arg_loc._fix_offset(None, size, arch=self.project.arch)
+        offset = arg_loc.check_offset(self.project.arch)
 
         if self._reaching_definitions is not None:
             # Find its definition
@@ -310,9 +313,7 @@ class CallSiteMaker(Analysis):
 
         fmt_str = None
         min_arg_count = (max(potential_fmt_args) + 1)
-        arg_locs = cc.arg_locs(is_fp=[False] * min_arg_count,
-                               sizes=[self.project.arch.bytes] * min_arg_count
-                               )
+        arg_locs = cc.arg_locs(SimCC.guess_prototype([0]*min_arg_count, proto))
 
         for fmt_arg_idx in potential_fmt_args:
             arg_loc = arg_locs[fmt_arg_idx]

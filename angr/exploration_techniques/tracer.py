@@ -127,6 +127,7 @@ class Tracer(ExplorationTechnique):
     :param crash_addr:          If the trace resulted in a crash, provide the crashing instruction
                                 pointer here, and the 'crashed' stash will be populated with the
                                 crashing state.
+    :param syscall_data:        Data related to various syscalls recorded by tracer for replaying
     :param copy_states:         Whether COPY_STATES should be enabled for the tracing state. It is
                                 off by default because most tracing workloads benefit greatly from
                                 not performing copying. You want to enable it if you want to see
@@ -147,6 +148,7 @@ class Tracer(ExplorationTechnique):
             resiliency=False,
             keep_predecessors=1,
             crash_addr=None,
+            syscall_data=None,
             copy_states=False,
             fast_forward_to_entry=True,
             mode=TracingMode.Strict,
@@ -156,6 +158,7 @@ class Tracer(ExplorationTechnique):
         self._trace = trace
         self._resiliency = resiliency
         self._crash_addr = crash_addr
+        self._syscall_data = syscall_data
         self._copy_states = copy_states
         self._mode = mode
         self._aslr = aslr
@@ -171,6 +174,10 @@ class Tracer(ExplorationTechnique):
 
         # whether we should follow the trace
         self._no_follow = self._trace is None
+
+        # Keep track of count of termination point
+        self._last_block_total_count = self._trace.count(self._trace[-1])
+        self._last_block_seen_count = 0
 
         # sanity check: copy_states must be enabled in Permissive mode since we may need to backtrack from a previous
         # state.
@@ -314,7 +321,7 @@ class Tracer(ExplorationTechnique):
 
     def step(self, simgr, stash='active', **kwargs):
         simgr.drop(stash='missed')
-        return simgr.step(stash=stash, **kwargs)
+        return simgr.step(stash=stash, syscall_data=self._syscall_data, **kwargs)
 
     def step_state(self, simgr, state, **kwargs):
         if state.history.jumpkind == 'Ijk_Exit':
@@ -342,8 +349,17 @@ class Tracer(ExplorationTechnique):
                 self.project.hook(state.addr, RepHook(insn.mnemonic.split(" ")[1]).run, length=insn.size)
 
         # perform the step. ask qemu to stop at the termination point.
-        stops = set(kwargs.pop('extra_stop_points', ())) | {self._trace[-1]}
-        succs_dict = simgr.step_state(state, extra_stop_points=stops, **kwargs)
+        # if termination point occurs multiple times in trace, pass details to SimEngineUnicorn's native interface so
+        # that it can stop at last block
+        if self._last_block_total_count > 1:
+            stops = set(kwargs.pop('extra_stop_points', ()))
+            last_block_details = {"addr": self._trace[-1], "tot_count": self._last_block_total_count,
+                                  "curr_count": self._last_block_seen_count}
+        else:
+            stops = set(kwargs.pop('extra_stop_points', ())) | {self._trace[-1]}
+            last_block_details = None
+
+        succs_dict = simgr.step_state(state, extra_stop_points=stops, last_block_details=last_block_details, **kwargs)
         if None not in succs_dict and simgr.errored:
             raise simgr.errored[-1].error
         sat_succs = succs_dict[None]  # satisfiable states
@@ -442,21 +458,20 @@ class Tracer(ExplorationTechnique):
         idx = succs[0].globals['trace_idx']
 
         res = []
-        for succ in succs:
-            try:
-                if self._compare_addr(self._trace[idx + 1], succ.addr):
+        last_description = succs[0].history.descriptions[-1]
+        if 'Unicorn' in last_description:
+            # Multiple new states were created in SimEngineUnicorn. State which has non-zero recent block count is a
+            # valid successor since only correct successor is sync'd with native state
+            for succ in succs:
+                if succ.history.recent_block_count > 0:
                     res.append(succ)
-                else:
-                    *_, last_description = succ.history.descriptions
-                    if 'Unicorn' in last_description:
-                        # A new state was created in SimEngineUnicorn. Check every recent basic block to see if any
-                        # match the next expected index
-                        for bbl_addr in succ.history.recent_bbl_addrs:
-                            if self._compare_addr(self._trace[idx + 1], bbl_addr):
-                                res.append(succ)
-                                break
-            except AngrTracerError:
-                pass
+        else:
+            for succ in succs:
+                try:
+                    if self._compare_addr(self._trace[idx + 1], succ.addr):
+                        res.append(succ)
+                except AngrTracerError:
+                    pass
 
         if not res:
             raise Exception("No states followed the trace?")
@@ -472,6 +487,8 @@ class Tracer(ExplorationTechnique):
         sync = state.globals['sync_idx']
         timer = state.globals['sync_timer']
 
+        self._last_block_seen_count += state.history.recent_bbl_addrs.count(self._trace[-1])
+
         if state.history.recent_block_count > 1:
             # multiple blocks were executed this step. they should follow the trace *perfectly*
             # or else something is up
@@ -481,7 +498,8 @@ class Tracer(ExplorationTechnique):
             assert state.history.recent_block_count == len(state.history.recent_bbl_addrs)
 
             for addr_idx, addr in enumerate(state.history.recent_bbl_addrs):
-                if addr == state.unicorn.transmit_addr:
+                if addr in [state.unicorn.cgc_transmit_addr, state.unicorn.cgc_receive_addr,
+                  state.unicorn.cgc_random_addr]:
                     continue
 
                 if sync is not None and sync != 'entry':
@@ -656,8 +674,8 @@ class Tracer(ExplorationTechnique):
 
             curr_block_addr = curr_block.addr + curr_block.size
 
-        for last_contain_index in range(trace_match_idx, trace_curr_idx + 1):
-            if self._trace[last_contain_index] < big_block_start or self._trace[last_contain_index] > big_block_end:
+        for last_contain_index in range(trace_match_idx + 1, trace_curr_idx + 1):
+            if self._trace[last_contain_index] <= big_block_start or self._trace[last_contain_index] > big_block_end:
                 # This qemu block is not contained in the bigger block
                 return (False, -1)
 
