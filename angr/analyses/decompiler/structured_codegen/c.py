@@ -96,7 +96,8 @@ class CConstruct:
                                 addr_to_pos.add_mapping(obj.tags['ins_addr'], pos)
 
                     # add all variables, constants, and function calls to map_pos_to_node for highlighting
-                    if isinstance(obj, (CVariable, CConstant, CStructField, CIndexedVariable, CVariableField)):
+                    # add ops to pos_to_node but NOT ast_to_pos
+                    if isinstance(obj, (CVariable, CConstant, CStructField, CIndexedVariable, CVariableField, CBinaryOp, CUnaryOp)):
                         if pos_to_node is not None:
                             pos_to_node.add_mapping(pos, len(s), obj)
                     elif isinstance(obj, CFunctionCall):
@@ -394,11 +395,12 @@ class CExpression(CConstruct):
     Base class for C expressions.
     """
 
-    __slots__ = ('_type', )
+    __slots__ = ('_type', 'collapsed', )
 
-    def __init__(self, **kwargs):
+    def __init__(self, collapsed=False, **kwargs):
         super().__init__(**kwargs)
         self._type = None
+        self.collapsed = collapsed
 
     @property
     def type(self):
@@ -1020,25 +1022,10 @@ class CStructField(CExpression):
         return self.struct_type.fields[self.field]
 
     def c_repr_chunks(self, indent=0, asexpr=False):
+        if self.collapsed:
+            yield '...', self
+            return
         yield str(self.field), self
-
-
-class CPlaceholder(CExpression):
-    # pylint:disable=abstract-method
-
-    __slots__ = ('placeholder', )
-
-    def __init__(self, placeholder, **kwargs):
-        super().__init__(**kwargs)
-
-        self.placeholder: str = placeholder
-
-    def c_repr_chunks(self, indent=0, asexpr=False):
-        yield self.placeholder, self
-
-    @property
-    def type(self):
-        return None
 
 
 class CVariable(CExpression):
@@ -1179,6 +1166,9 @@ class CVariable(CExpression):
         yield from cast.c_repr_chunks()
 
     def c_repr_chunks(self, indent=0, asexpr=False):
+        if self.collapsed:
+            yield '...', self
+            return
 
         v = self.variable if self.unified_variable is None else self.unified_variable
 
@@ -1244,6 +1234,9 @@ class CIndexedVariable(CExpression):
         return self._type
 
     def c_repr_chunks(self, indent=0, asexpr=False):
+        if self.collapsed:
+            yield '...', self
+            return
         if isinstance(self.index, int):
             bracket = CClosingObject("[")
             # it's pointing to an array! take the corresponding element
@@ -1278,6 +1271,9 @@ class CVariableField(CExpression):
         return self.field.type
 
     def c_repr_chunks(self, indent=0, asexpr=False):
+        if self.collapsed:
+            yield '...', self
+            return
         yield from self.variable.c_repr_chunks()
         if self.var_is_ptr:
             yield "->", self
@@ -1322,6 +1318,9 @@ class CUnaryOp(CExpression):
         return self._type
 
     def c_repr_chunks(self, indent=0, asexpr=False):
+        if self.collapsed:
+            yield '...', self
+            return
 
         OP_MAP = {
             'Not': self._c_repr_chunks_not,
@@ -1404,6 +1403,9 @@ class CBinaryOp(CExpression):
         return len(precedence_list)
 
     def c_repr_chunks(self, indent=0, asexpr=False):
+        if self.collapsed:
+            yield '...', self
+            return
 
         if self.variable is not None:
             yield "&", self
@@ -1553,6 +1555,9 @@ class CTypeCast(CExpression):
         return self._type
 
     def c_repr_chunks(self, indent=0, asexpr=False):
+        if self.collapsed:
+            yield '...', self
+            return
         leading_paren = False
         wrapping_paren = False
         paren = CClosingObject("(")
@@ -1594,6 +1599,57 @@ class CConstant(CExpression):
         self.tags = tags
 
     @property
+    def _ident(self):
+        ident = (self.tags or {}).get('ins_addr', None)
+        if ident is not None:
+            return ('inst', ident)
+        else:
+            return ('val', self.value)
+
+    @property
+    def fmt(self):
+        return self.codegen.const_formats.get(self._ident, {})
+
+    @property
+    def _fmt_setter(self):
+        result = self.codegen.const_formats.get(self._ident, None)
+        if result is None:
+            result = {}
+            self.codegen.const_formats[self._ident] = result
+
+        return result
+
+    @property
+    def fmt_hex(self):
+        result = self.fmt.get('hex', None)
+        if result is None:
+            result = False
+            if isinstance(self.value, int):
+                result = hex(self.value).endswith('00') or is_alignment_mask(self.value)
+        return result
+
+    @fmt_hex.setter
+    def fmt_hex(self, v):
+        self._fmt_setter['hex'] = v
+
+    @property
+    def fmt_neg(self):
+        result = self.fmt.get('neg', None)
+        if result is None:
+            result = False
+            if isinstance(self.value, int):
+                if self.value <= 0xffff_ffff and self.value >= 0xf000_0000:
+                    result = True
+                elif self.value <= 0xffff_ffff_ffff_ffff and self.value >= 0xf000_0000_0000_0000:
+                    result = True
+
+        return result
+
+    @fmt_neg.setter
+    def fmt_neg(self, v):
+        self._fmt_setter['neg'] = v
+
+    @property
     def type(self):
         return self._type
 
@@ -1608,6 +1664,9 @@ class CConstant(CExpression):
         return f"\"{base_str}\""
 
     def c_repr_chunks(self, indent=0, asexpr=False):
+        if self.collapsed:
+            yield '...', self
+            return
 
         # default priority: string references -> variables -> other reference values
         if self.reference_values is not None:
@@ -1638,15 +1697,19 @@ class CConstant(CExpression):
             yield hex(self.value), self
 
         elif isinstance(self.value, int):
-            # before resorting to properly typed integers, let's use the following hack.
-            # print out integers as a negative number if they can be negative
-            if self.value <= 0xffffffff and self.value >= 0xf0000000:
-                yield str(0xffffffff + ~self.value), self
-            elif self.value <= 0xffff_ffff_ffff_ffff and self.value >= 0xf000_0000_0000_0000:
-                yield str(0xffff_ffff_ffff_ffff + ~self.value), self
-            else:
-                yield str(self.value), self
+            value = self.value
+            if self.fmt_neg:
+                if value > 0:
+                    value = value - 2**self._type.size
+                elif value < 0:
+                    value = value + 2**self._type.size
 
+            if self.fmt_hex:
+                str_value = hex(value)
+            else:
+                str_value = str(value)
+
+            yield str_value, self
         else:
             yield str(self.value), self
 
@@ -1687,6 +1750,9 @@ class CITE(CExpression):
         return SimTypeInt()
 
     def c_repr_chunks(self, indent=0, asexpr=False):
+        if self.collapsed:
+            yield '...', self
+            return
         paren = CClosingObject("(")
         yield "(", paren
         yield from self.cond.c_repr_chunks()
@@ -1714,6 +1780,9 @@ class CDirtyExpression(CExpression):
         return SimTypeInt()
 
     def c_repr_chunks(self, indent=0, asexpr=False):
+        if self.collapsed:
+            yield '...', self
+            return
         yield str(self.dirty), None
 
 
@@ -1732,7 +1801,8 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis):
     def __init__(self, func, sequence, indent=0, cfg=None, variable_kb=None,
                  func_args: Optional[List[SimVariable]]=None, binop_depth_cutoff: int=10,
                  show_casts=True, braces_on_own_lines=True, use_compound_assignments=True, show_local_types=True,
-                 flavor=None, stmt_comments=None, expr_comments=None, show_externs=True, externs=None):
+                 flavor=None, stmt_comments=None, expr_comments=None, show_externs=True, externs=None,
+                 const_formats=None):
         super().__init__(flavor=flavor)
 
         self._handlers = {
@@ -1788,6 +1858,7 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis):
         self.show_local_types = show_local_types
         self.expr_comments: Dict[int,str] = expr_comments if expr_comments is not None else {}
         self.stmt_comments: Dict[int,str] = stmt_comments if stmt_comments is not None else {}
+        self.const_formats: Dict[Any, Dict[str, Any]] = const_formats if const_formats is not None else {}
         self.externs = externs or set()
         self.show_externs = show_externs
 
@@ -2588,10 +2659,6 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis):
                         )
 
     def _handle_Expr_BinaryOp(self, expr):
-
-        if expr.depth > self.binop_depth_cutoff:
-            return CPlaceholder("...", codegen=self)
-
         lhs = self._handle(expr.operands[0])
         rhs = self._handle(expr.operands[1])
 
@@ -2599,6 +2666,7 @@ class CStructuredCodeGenerator(BaseStructuredCodeGenerator, Analysis):
                          variable=self._handle(expr.variable) if expr.variable is not None else None,
                          tags=expr.tags,
                          codegen=self,
+                         collapsed=expr.depth > self.binop_depth_cutoff,
                          )
 
     def _handle_Expr_Convert(self, expr):
