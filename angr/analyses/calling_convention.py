@@ -20,6 +20,9 @@ from . import Analysis, register_analysis, ReachingDefinitionsAnalysis
 from .reaching_definitions.function_handler import FunctionHandler
 
 if TYPE_CHECKING:
+    from angr.code_location import CodeLocation
+    from angr.analyses.reaching_definitions.dep_graph import DepGraph
+    from angr.analyses.reaching_definitions.rd_state import ReachingDefinitionsState
     from ..knowledge_plugins.functions import Function
     from ..knowledge_plugins.cfg import CFGModel
     from ..knowledge_plugins.key_definitions.uses import Uses
@@ -105,7 +108,9 @@ class CallingConventionAnalysis(Analysis):
         if self._function.is_simprocedure:
             if self._function.prototype is None:
                 # try our luck
-                self._function.find_declaration()
+                # we set ignore_binary_name to True because the binary name SimProcedures is "cle##externs" and does not
+                # match any library name
+                self._function.find_declaration(ignore_binary_name=True)
 
             self.cc = self._function.calling_convention
             self.prototype = self._function.prototype
@@ -475,7 +480,7 @@ class CallingConventionAnalysis(Analysis):
             else:
                 reg_offsets: Set[int] = set(r.reg for r in reg_vars_with_single_access)
                 for var_ in var_manager.get_variables(sort="reg"):
-                    if var_.reg in reg_offsets:
+                    if var_.reg in (reg_offsets - {self.project.arch.ret_offset}):
                         # check if there is only a write to it
                         accesses = var_manager.get_variable_accesses(var_)
                         if len(accesses) == 1 and accesses[0].access_type == VariableAccessSort.WRITE:

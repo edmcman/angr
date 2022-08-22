@@ -81,6 +81,7 @@ class VariableManagerInternal(Serializable):
         self._variables_to_unified_variables: Dict[SimVariable, SimVariable] = { }
 
         self._phi_variables = { }
+        self._variables_to_phivars = defaultdict(set)
         self._phi_variables_by_block = defaultdict(set)
 
         self.types = TypesStore(self.manager._kb)
@@ -119,12 +120,24 @@ class VariableManagerInternal(Serializable):
         memory_variables = [ ]
 
         for variable in self._variables:
+            vc = variable.serialize_to_cmessage()
             if isinstance(variable, SimRegisterVariable):
-                register_variables.append(variable.serialize_to_cmessage())
+                register_variables.append(vc)
             elif isinstance(variable, SimStackVariable):
-                stack_variables.append(variable.serialize_to_cmessage())
+                stack_variables.append(vc)
             elif isinstance(variable, SimMemoryVariable):
-                memory_variables.append(variable.serialize_to_cmessage())
+                memory_variables.append(vc)
+            else:
+                raise NotImplementedError()
+        for variable in self._phi_variables:
+            vc = variable.serialize_to_cmessage()
+            vc.base.is_phi = True
+            if isinstance(variable, SimRegisterVariable):
+                register_variables.append(vc)
+            elif isinstance(variable, SimStackVariable):
+                stack_variables.append(vc)
+            elif isinstance(variable, SimMemoryVariable):
+                memory_variables.append(vc)
             else:
                 raise NotImplementedError()
 
@@ -167,6 +180,19 @@ class VariableManagerInternal(Serializable):
             relations.append(relation)
         cmsg.var2unified.extend(relations)
 
+        # phi vars
+        phi_relations = []
+        for phi, vars_ in self._phi_variables.items():
+            for var in vars_:
+                if var not in self._variables and var not in self._phi_variables:
+                    l.error("Ignore variable %s because it is not in the registered list.", var.ident)
+                    continue
+                relation = variables_pb2.Phi2Var()
+                relation.phi_ident = phi.ident
+                relation.var_ident = var.ident
+                phi_relations.append(relation)
+        cmsg.phi2var.extend(phi_relations)
+
         # TODO: Types
 
         return cmsg
@@ -178,18 +204,20 @@ class VariableManagerInternal(Serializable):
         variable_by_ident = {}
 
         # variables
+        all_vars = []
+
         for regvar_pb2 in cmsg.regvars:
-            regvar = SimRegisterVariable.parse_from_cmessage(regvar_pb2)
-            variable_by_ident[regvar.ident] = regvar
-            model._variables.add(regvar)
+            all_vars.append((regvar_pb2.base.is_phi, SimRegisterVariable.parse_from_cmessage(regvar_pb2)))
         for stackvar_pb2 in cmsg.stackvars:
-            stackvar = SimStackVariable.parse_from_cmessage(stackvar_pb2)
-            variable_by_ident[stackvar.ident] = stackvar
-            model._variables.add(stackvar)
+            all_vars.append((stackvar_pb2.base.is_phi, SimStackVariable.parse_from_cmessage(stackvar_pb2)))
         for memvar_pb2 in cmsg.memvars:
-            memvar = SimMemoryVariable.parse_from_cmessage(memvar_pb2)
-            variable_by_ident[memvar.ident] = memvar
-            model._variables.add(memvar)
+            all_vars.append((memvar_pb2.base.is_phi, SimMemoryVariable.parse_from_cmessage(memvar_pb2)))
+        for is_phi, var in all_vars:
+            variable_by_ident[var.ident] = var
+            if is_phi:
+                model._phi_variables[var] = set()
+            else:
+                model._variables.add(var)
 
         # variable accesses
         for varaccess_pb2 in cmsg.accesses:
@@ -225,7 +253,34 @@ class VariableManagerInternal(Serializable):
             unified = unified_variable_by_ident[var2unified.unified_var_ident]
             model._variables_to_unified_variables[variable] = unified
 
+        for phi2var in cmsg.phi2var:
+            phi = variable_by_ident.get(phi2var.phi_ident, None)
+            if phi is None:
+                l.warning("Phi variable %s is not found in variable_by_ident.", phi2var.phi_ident)
+                continue
+            var = variable_by_ident.get(phi2var.var_ident, None)
+            if var is None:
+                l.warning("Variable %s is not found in variable_by_ident.", phi2var.var_ident)
+                continue
+            model._phi_variables[phi].add(var)
+            model._variables_to_phivars[var].add(phi)
+
         # TODO: Types
+
+        for var in model._variables:
+            if isinstance(var, SimStackVariable):
+                region = model._stack_region
+                offset = var.offset
+            elif isinstance(var, SimRegisterVariable):
+                region = model._register_region
+                offset = var.reg
+            elif isinstance(var, SimMemoryVariable):
+                region = model._global_region
+                offset = var.addr
+            else:
+                raise ValueError('Unsupported sort %s in parse_from_cmessage().' % type(var))
+
+            region.add_variable(offset, var)
 
         return model
 
@@ -270,6 +325,7 @@ class VariableManagerInternal(Serializable):
             # implicitly overwrite or add I guess
             pass
         region.add_variable(start, variable)
+        self._variables.add(variable)
 
     def set_variable(self, sort, start, variable: SimVariable):
         if sort == 'stack':
@@ -290,6 +346,7 @@ class VariableManagerInternal(Serializable):
             # implicitly overwrite or add I guess
             pass
         region.set_variable(start, variable)
+        self._variables.add(variable)
 
     def write_to(self, variable, offset, location, overwrite=False, atom=None):
         self._record_variable_access(VariableAccessSort.WRITE, variable, offset, location, overwrite=overwrite,
@@ -304,6 +361,7 @@ class VariableManagerInternal(Serializable):
                                      atom=atom)
 
     def _record_variable_access(self, sort: int, variable, offset, location, overwrite=False, atom=None):
+        # TODO can this line be removed, should we be only adding to _variables in add_variable?
         self._variables.add(variable)
         var_and_offset = variable, offset
         atom_hash = (hash(atom) & 0xffff_ffff) if atom is not None else None
@@ -336,7 +394,11 @@ class VariableManagerInternal(Serializable):
                 existing_phis.add(var)
             else:
                 non_phis.add(var)
-        if len(existing_phis) == 1:
+            if var in self._variables_to_phivars:
+                for phivar in self._variables_to_phivars[var]:
+                    existing_phis.add(phivar)
+
+        if len(existing_phis) >= 1:
             existing_phi = next(iter(existing_phis))
             if block_addr in self._phi_variables_by_block and existing_phi in self._phi_variables_by_block[block_addr]:
                 if not non_phis.issubset(self.get_phi_subvariables(existing_phi)):
@@ -362,6 +424,8 @@ class VariableManagerInternal(Serializable):
         # Keep a record of all phi variables
         self._phi_variables[a] = set(variables)
         self._phi_variables_by_block[block_addr].add(a)
+        for var in variables:
+            self._variables_to_phivars[var].add(a)
 
         return a
 

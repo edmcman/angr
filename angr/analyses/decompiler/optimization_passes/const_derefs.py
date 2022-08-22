@@ -6,7 +6,6 @@ from ailment import Block
 from ailment.expression import Load, Const, BinaryOp, UnaryOp
 from ailment.statement import Statement, Assignment, Call, ConditionalJump
 
-from ... import AnalysesHub
 from ..ailgraph_walker import AILGraphWalker
 from ..ailblock_walker import AILBlockWalker
 from .optimization_pass import OptimizationPass, OptimizationPassStage
@@ -182,7 +181,7 @@ class ConstantDereferencesSimplifier(OptimizationPass):
     """
 
     # TODO: This optimization pass may support more architectures and platforms
-    ARCHES = ["X86", "AMD64", "ARMEL", "ARMHF", "ARMCortexM"]
+    ARCHES = ["X86", "AMD64", "ARMEL", "ARMHF", "ARMCortexM", "MIPS32", "MIPS64"]
     PLATFORMS = ["linux"]
     STAGE = OptimizationPassStage.AFTER_GLOBAL_SIMPLIFICATION
     NAME = "Simplify constant dereferences"
@@ -205,6 +204,3 @@ class ConstantDereferencesSimplifier(OptimizationPass):
     def _walk_block(self, block: Block) -> Optional[Block]:
         new_block = self._block_walker.walk(block)
         return new_block
-
-
-AnalysesHub.register_default("ConstantDereferencesSimplifier", ConstantDereferencesSimplifier)

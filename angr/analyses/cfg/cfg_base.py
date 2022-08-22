@@ -17,6 +17,7 @@ from ...knowledge_plugins.functions.function_manager import FunctionManager
 from ...knowledge_plugins.functions.function import Function
 from ...knowledge_plugins.cfg import IndirectJump, CFGNode, CFGENode, CFGModel  # pylint:disable=unused-import
 from ...misc.ux import deprecated
+from ...procedures.stubs.UnresolvableJumpTarget import UnresolvableJumpTarget
 from ...utils.constants import DEFAULT_STATEMENT
 from ...procedures.procedure_dict import SIM_PROCEDURES
 from ...errors import SimTranslationError, SimMemoryError, SimIRSBError, SimEngineError, AngrUnsupportedSyscallError, \
@@ -677,10 +678,41 @@ class CFGBase(Analysis):
             # test if addr_b also does not belong to any section
             dst_section = obj.find_section_containing(addr_b)
             if dst_section is None:
-                return True
+                return self._addrs_belong_to_same_segment(addr_a, addr_b)
             return False
 
         return src_section.contains_addr(addr_b)
+
+    def _addrs_belong_to_same_segment(self, addr_a, addr_b):
+        """
+        Test if two addresses belong to the same segment.
+
+        :param int addr_a:  The first address to test.
+        :param int addr_b:  The second address to test.
+        :return:            True if the two addresses belong to the same segment or both of them do not belong to any
+                            section, False otherwise.
+        :rtype:             bool
+        """
+
+        obj = self.project.loader.find_object_containing(addr_a, membership_check=False)
+
+        if obj is None:
+            # test if addr_b also does not belong to any object
+            obj_b = self.project.loader.find_object_containing(addr_b, membership_check=False)
+            if obj_b is None:
+                return True
+            return False
+
+        src_segment = obj.find_segment_containing(addr_a)
+        if src_segment is None:
+            # test if addr_b also does not belong to any section
+            dst_segment = obj.find_segment_containing(addr_b)
+            if dst_segment is None:
+                return True
+            return False
+
+        return src_segment.contains_addr(addr_b)
+
 
     def _object_has_executable_sections(self, obj):
         """
@@ -849,7 +881,12 @@ class CFGBase(Analysis):
 
             # determine where it jumps/returns to
             goout_site_successors = goout_site.successors()
-            if not goout_site_successors:
+            # Filter out UnresolvableJumpTarget because those don't mean that we actually know where it jumps to
+            known_successors = list(
+                filter(lambda n: not (isinstance(n, HookNode) and n.sim_procedure == UnresolvableJumpTarget),
+                       goout_site_successors))
+
+            if not known_successors:
                 # not sure where it jumps to. bail out
                 bail_out = True
                 continue
@@ -1408,7 +1445,7 @@ class CFGBase(Analysis):
         missing_cfg_nodes = { node for node in missing_cfg_nodes if node.function_address is not None }
         if missing_cfg_nodes:
             l.debug('%d CFGNodes are missing in the first traversal.', len(missing_cfg_nodes))
-            secondary_function_nodes |=  missing_cfg_nodes
+            secondary_function_nodes |= missing_cfg_nodes
 
         min_stage_3_progress = 90.0
         max_stage_3_progress = 99.9

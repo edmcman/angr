@@ -71,8 +71,7 @@ class MemoryValue(ctypes.Structure):
 
     _fields_ = [
         ('address', ctypes.c_uint64),
-        ('value', ctypes.c_uint8 * _MAX_MEM_ACCESS_SIZE),
-        ('size', ctypes.c_uint64),
+        ('value', ctypes.c_uint8),
         ('is_value_symbolic', ctypes.c_bool)
     ]
 
@@ -88,13 +87,13 @@ class RegisterValue(ctypes.Structure):
         ('value', ctypes.c_uint8 * _MAX_REGISTER_BYTE_SIZE),
         ('size', ctypes.c_int64)
     ]
-class InstrDetails(ctypes.Structure):
+class VEXStmtDetails(ctypes.Structure):
     """
-    struct sym_instr_details_t
+    struct sym_vex_stmt_details_t
     """
 
     _fields_ = [
-        ('instr_addr', ctypes.c_uint64),
+        ('stmt_idx', ctypes.c_int64),
         ('has_memory_dep', ctypes.c_bool),
         ('memory_values', ctypes.POINTER(MemoryValue)),
         ('memory_values_count', ctypes.c_uint64),
@@ -110,8 +109,8 @@ class BlockDetails(ctypes.Structure):
         ('block_size', ctypes.c_uint64),
         ('block_trace_ind', ctypes.c_int64),
         ('has_symbolic_exit', ctypes.c_bool),
-        ('symbolic_instrs', ctypes.POINTER(InstrDetails)),
-        ('symbolic_instrs_count', ctypes.c_uint64),
+        ('symbolic_vex_stmts', ctypes.POINTER(VEXStmtDetails)),
+        ('symbolic_vex_stmts_count', ctypes.c_uint64),
         ('register_values', ctypes.POINTER(RegisterValue)),
         ('register_values_count', ctypes.c_uint64),
     ]
@@ -149,10 +148,8 @@ class STOP:
     STOP_UNSUPPORTED_STMT_UNKNOWN = 25
     STOP_UNSUPPORTED_EXPR_UNKNOWN = 26
     STOP_UNKNOWN_MEMORY_WRITE_SIZE = 27
-    STOP_SYMBOLIC_MEM_DEP_NOT_LIVE = 28
-    STOP_SYSCALL_ARM    = 29
-    STOP_SYMBOLIC_MEM_DEP_NOT_LIVE_CURR_BLOCK = 30
-    STOP_X86_CPUID = 31
+    STOP_SYSCALL_ARM    = 28
+    STOP_X86_CPUID      = 29
 
     stop_message = {}
     stop_message[STOP_NORMAL]        = "Reached maximum steps"
@@ -183,17 +180,13 @@ class STOP:
     stop_message[STOP_UNSUPPORTED_EXPR_GETI]   = "Symbolic taint propagation for GetI expression not yet supported"
     stop_message[STOP_UNSUPPORTED_STMT_UNKNOWN]= "Canoo propagate symbolic taint for unsupported VEX statement type"
     stop_message[STOP_UNSUPPORTED_EXPR_UNKNOWN]= "Cannot propagate symbolic taint for unsupported VEX expression"
-    stop_message[STOP_UNKNOWN_MEMORY_WRITE_SIZE] = "Cannot determine size of memory write; likely because unicorn didn't"
-    stop_message[STOP_SYMBOLIC_MEM_DEP_NOT_LIVE] = "A symbolic memory dependency on stack is no longer in scope"
+    stop_message[STOP_UNKNOWN_MEMORY_WRITE_SIZE] = "Unicorn failed to determine size of memory write"
     stop_message[STOP_SYSCALL_ARM]   = "ARM syscalls are currently not supported by SimEngineUnicorn"
-    stop_message[STOP_SYMBOLIC_MEM_DEP_NOT_LIVE_CURR_BLOCK] = ("An instruction in current block overwrites a symbolic "
-                                                               "value needed for re-executing some instruction in same "
-                                                               "block")
     stop_message[STOP_X86_CPUID] = "Block executes cpuid which should be handled in VEX engine"
 
     symbolic_stop_reasons = [STOP_SYMBOLIC_PC, STOP_SYMBOLIC_READ_ADDR, STOP_SYMBOLIC_READ_SYMBOLIC_TRACKING_DISABLED,
         STOP_SYMBOLIC_WRITE_ADDR, STOP_SYMBOLIC_BLOCK_EXIT_CONDITION, STOP_SYMBOLIC_BLOCK_EXIT_TARGET, STOP_SYSCALL_ARM,
-        STOP_SYMBOLIC_MEM_DEP_NOT_LIVE_CURR_BLOCK, STOP_X86_CPUID]
+        STOP_X86_CPUID]
 
     unsupported_reasons = [STOP_UNSUPPORTED_STMT_PUTI, STOP_UNSUPPORTED_STMT_STOREG, STOP_UNSUPPORTED_STMT_LOADG,
         STOP_UNSUPPORTED_STMT_CAS, STOP_UNSUPPORTED_STMT_LLSC, STOP_UNSUPPORTED_STMT_DIRTY,
@@ -408,7 +401,8 @@ def _load_native():
             getattr(handle, func).argtypes = argtypes
 
         #_setup_prototype_explicit(h, 'logSetLogLevel', None, ctypes.c_uint64)
-        _setup_prototype(h, 'alloc', state_t, uc_engine_t, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_bool)
+        _setup_prototype(h, 'alloc', state_t, uc_engine_t, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_bool,
+                         ctypes.c_bool)
         _setup_prototype(h, 'dealloc', None, state_t)
         _setup_prototype(h, 'hook', None, state_t)
         _setup_prototype(h, 'unhook', None, state_t)
@@ -442,8 +436,9 @@ def _load_native():
         _setup_prototype(h, 'set_vex_to_unicorn_reg_mappings', None, state_t, ctypes.POINTER(ctypes.c_uint64),
                          ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64), ctypes.c_uint64)
         _setup_prototype(h, 'set_artificial_registers', None, state_t, ctypes.POINTER(ctypes.c_uint64), ctypes.c_uint64)
-        _setup_prototype(h, 'get_count_of_blocks_with_symbolic_instrs', ctypes.c_uint64, state_t)
-        _setup_prototype(h, 'get_details_of_blocks_with_symbolic_instrs', None, state_t, ctypes.POINTER(BlockDetails))
+        _setup_prototype(h, 'get_count_of_blocks_with_symbolic_vex_stmts', ctypes.c_uint64, state_t)
+        _setup_prototype(h, 'get_details_of_blocks_with_symbolic_vex_stmts', None, state_t,
+                         ctypes.POINTER(BlockDetails))
         _setup_prototype(h, 'get_stop_details', StopDetails, state_t)
         _setup_prototype(h, 'set_register_blacklist', None, state_t, ctypes.POINTER(ctypes.c_uint64), ctypes.c_uint64)
         _setup_prototype(h, 'set_cpu_flags_details', None, state_t, ctypes.POINTER(ctypes.c_uint64),
@@ -451,6 +446,11 @@ def _load_native():
         _setup_prototype(h, 'set_fd_bytes', state_t, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64)
         _setup_prototype(h, 'set_random_syscall_data', None, state_t, ctypes.POINTER(ctypes.c_uint64),
                          ctypes.POINTER(ctypes.c_uint64), ctypes.c_uint64)
+        _setup_prototype(h, 'set_vex_cc_reg_data', None, state_t, ctypes.POINTER(ctypes.c_uint64),
+                         ctypes.POINTER(ctypes.c_uint64), ctypes.c_uint64)
+        _setup_prototype(h, 'get_count_of_writes_to_reexecute', ctypes.c_uint64, state_t)
+        _setup_prototype(h, 'get_concrete_writes_to_reexecute', None, state_t, ctypes.POINTER(ctypes.c_uint64),
+                         ctypes.POINTER(ctypes.c_uint8))
 
         l.info('native plugin is enabled')
 
@@ -579,9 +579,6 @@ class Unicorn(SimStatePlugin):
         self.cgc_random_addr = None
 
         self.time = None
-
-        # Concrete bytes of open fds
-        self.fd_bytes = {}
 
         self._bullshit_cb = ctypes.cast(unicorn.unicorn.UC_HOOK_MEM_INVALID_CB(self._hook_mem_unmapped),
                                         unicorn.unicorn.UC_HOOK_MEM_INVALID_CB)
@@ -1020,9 +1017,8 @@ class Unicorn(SimStatePlugin):
             _UC_NATIVE.activate_page(self._uc_state, addr, int(ffi.cast('uint64_t', ffi.from_buffer(bitmap))),
                                      int(ffi.cast('unsigned long', ffi.from_buffer(data))))
 
-
-    def _get_details_of_blocks_with_symbolic_instrs(self):
-        def _get_register_values(register_values):
+    def _get_details_of_blocks_with_symbolic_vex_stmts(self):
+        def _get_reg_values(register_values):
             for register_value in register_values:
                 # Convert the register value in bytes to number of appropriate size and endianness
                 reg_name = self.state.arch.register_size_names[(register_value.offset, register_value.size)]
@@ -1036,29 +1032,29 @@ class Unicorn(SimStatePlugin):
 
         def _get_memory_values(memory_values):
             for memory_value in memory_values:
-                yield {"address": memory_value.address, "value": bytes(memory_value.value[:memory_value.size]),
-                       "size": memory_value.size, "symbolic": memory_value.is_value_symbolic}
+                yield {"address": memory_value.address, "value": bytes([memory_value.value]),
+                       "symbolic": memory_value.is_value_symbolic}
 
-        def _get_instr_details(symbolic_instrs):
-            for instr in symbolic_instrs:
-                instr_entry = {"instr_addr": instr.instr_addr, "mem_dep": []}
+        def _get_vex_stmt_details(symbolic_stmts):
+            for instr in symbolic_stmts:
+                instr_entry = {"stmt_idx": instr.stmt_idx, "mem_dep": []}
                 if instr.has_memory_dep:
                     instr_entry["mem_dep"] = _get_memory_values(instr.memory_values[:instr.memory_values_count])
 
                 yield instr_entry
 
-        block_count = _UC_NATIVE.get_count_of_blocks_with_symbolic_instrs(self._uc_state)
+        block_count = _UC_NATIVE.get_count_of_blocks_with_symbolic_vex_stmts(self._uc_state)
         if block_count == 0:
             return
 
         block_details_list = (BlockDetails * block_count)()
-        _UC_NATIVE.get_details_of_blocks_with_symbolic_instrs(self._uc_state, block_details_list)
+        _UC_NATIVE.get_details_of_blocks_with_symbolic_vex_stmts(self._uc_state, block_details_list)
         for block_details in block_details_list:
             entry = {"block_addr": block_details.block_addr, "block_size": block_details.block_size,
                      "block_hist_ind": block_details.block_trace_ind,
                      "has_symbolic_exit": block_details.has_symbolic_exit}
-            entry["registers"] = _get_register_values(block_details.register_values[:block_details.register_values_count])
-            entry["instrs"] = _get_instr_details(block_details.symbolic_instrs[:block_details.symbolic_instrs_count])
+            entry["registers"] = _get_reg_values(block_details.register_values[:block_details.register_values_count])
+            entry["stmts"] = _get_vex_stmt_details(block_details.symbolic_vex_stmts[:block_details.symbolic_vex_stmts_count])
             yield entry
 
     def uncache_region(self, addr, length):
@@ -1080,7 +1076,7 @@ class Unicorn(SimStatePlugin):
         """
         return self.state.arch.name == "MIPS32"
 
-    def setup(self, syscall_data=None):
+    def setup(self, syscall_data=None, fd_bytes=None):
         if self._is_mips32 and options.COPY_STATES not in self.state.options:
             # we always re-create the thread-local UC object for MIPS32 even if COPY_STATES is disabled in state
             # options. this is to avoid some weird bugs in unicorn (e.g., it reports stepping 1 step while in reality it
@@ -1140,8 +1136,6 @@ class Unicorn(SimStatePlugin):
                     l.error("You haven't set the address for receive syscall!!!!!!!!!!!!!!")
                 else:
                     cgc_receive_addr = self.cgc_receive_addr
-                    # Set stdin bytes in native interface
-                    self.fd_bytes[0] = bytearray(self.state.posix.fd.get(0).concretize()[0])
 
             if options.UNICORN_HANDLE_CGC_RANDOM_SYSCALL in self.state.options and syscall_data is not None:
                 if self.cgc_random_addr is None:
@@ -1167,10 +1161,13 @@ class Unicorn(SimStatePlugin):
             _UC_NATIVE.activate_page(self._uc_state, self.gdt.addr, bytes(0x1000), None)
 
         # Pass all concrete fd bytes to native interface so that it can handle relevant syscalls
-        for fd_num, fd_data in self.fd_bytes.items():
-            fd_bytes_p = int(ffi.cast('uint64_t', ffi.from_buffer(memoryview(fd_data))))
-            read_pos = self.state.solver.eval(self.state.posix.fd.get(fd_num).read_pos)
-            _UC_NATIVE.set_fd_bytes(self._uc_state, fd_num, fd_bytes_p, len(fd_data), read_pos)
+        if fd_bytes is not None:
+            for fd_num, fd_data in fd_bytes.items():
+                fd_bytes_p = int(ffi.cast('uint64_t', ffi.from_buffer(memoryview(fd_data))))
+                read_pos = self.state.solver.eval(self.state.posix.fd.get(fd_num).read_pos)
+                _UC_NATIVE.set_fd_bytes(self._uc_state, fd_num, fd_bytes_p, len(fd_data), read_pos)
+        else:
+            l.info("Input fds concrete data not specified. Handling some syscalls in native interface could fail.")
 
         # Initialize list of artificial VEX registers
         artificial_regs_list = self.state.arch.artificial_registers_offsets
@@ -1197,9 +1194,9 @@ class Unicorn(SimStatePlugin):
             flag_vex_offsets = []
             flag_bitmasks = []
             flag_uc_regs = []
-            for flag_vex_offset, (uc_reg, flag_bitmask) in self.state.arch.cpu_flag_register_offsets_and_bitmasks_map.items():
-                flag_vex_offsets.append(flag_vex_offset)
-                flag_bitmasks.append(flag_bitmask)
+            for flag_offset, (uc_reg, bitmask) in self.state.arch.cpu_flag_register_offsets_and_bitmasks_map.items():
+                flag_vex_offsets.append(flag_offset)
+                flag_bitmasks.append(bitmask)
                 flag_uc_regs.append(uc_reg)
 
             flag_vex_offsets_array = (ctypes.c_uint64 * len(flag_vex_offsets))(*map(ctypes.c_uint64, flag_vex_offsets))
@@ -1215,6 +1212,19 @@ class Unicorn(SimStatePlugin):
         if len(blacklist_regs_offsets) > 0:
             blacklist_regs_array = (ctypes.c_uint64 * len(blacklist_regs_offsets))(*map(ctypes.c_uint64, blacklist_regs_offsets))
             _UC_NATIVE.set_register_blacklist(self._uc_state, blacklist_regs_array, len(blacklist_regs_offsets))
+
+        # Initialize VEX CC registers data
+        if len(self.state.arch.vex_cc_regs) > 0:
+            cc_regs_offsets = []
+            cc_regs_sizes = []
+            for cc_reg in self.state.arch.vex_cc_regs:
+                cc_regs_offsets.append(cc_reg.vex_offset)
+                cc_regs_sizes.append(cc_reg.size)
+
+            cc_regs_offsets_array = (ctypes.c_uint64 * len(cc_regs_offsets))(*map(ctypes.c_uint64, cc_regs_offsets))
+            cc_regs_sizes_array = (ctypes.c_uint64 * len(cc_regs_offsets))(*map(ctypes.c_uint64, cc_regs_sizes))
+            _UC_NATIVE.set_vex_cc_reg_data(self._uc_state, cc_regs_offsets_array, cc_regs_sizes_array,
+                                           len(cc_regs_offsets))
 
     def start(self, step=None):
         self.jumpkind = 'Ijk_Boring'
@@ -1260,7 +1270,9 @@ class Unicorn(SimStatePlugin):
         unicorn_obj.stop_message = STOP.get_stop_msg(unicorn_obj.stop_reason)
         if unicorn_obj.stop_reason in (STOP.symbolic_stop_reasons + STOP.unsupported_reasons) or \
           unicorn_obj.stop_reason in {STOP.STOP_UNKNOWN_MEMORY_WRITE_SIZE, STOP.STOP_VEX_LIFT_FAILED}:
-            unicorn_obj.stop_message += f". Block 0x{unicorn_obj.stop_details.block_addr:02x}(size: {unicorn_obj.stop_details.block_size})."
+            stop_block_addr = unicorn_obj.stop_details.block_addr
+            stop_block_size = unicorn_obj.stop_details.block_size
+            unicorn_obj.stop_message += f". Block 0x{stop_block_addr:02x}(size: {stop_block_size})."
 
         # figure out why we stopped
         if unicorn_obj.stop_reason == STOP.STOP_NOSTART and unicorn_obj.steps > 0:
@@ -1283,7 +1295,8 @@ class Unicorn(SimStatePlugin):
         while bool(p_update):
             update = p_update.contents
             address, length = update.address, update.length
-            if unicorn_obj.gdt is not None and unicorn_obj.gdt.addr <= address < unicorn_obj.gdt.addr + unicorn_obj.gdt.limit:
+            if unicorn_obj.gdt is not None and \
+              unicorn_obj.gdt.addr <= address < unicorn_obj.gdt.addr + unicorn_obj.gdt.limit:
                 l.warning("Emulation touched fake GDT at %#x, discarding changes", unicorn_obj.gdt.addr)
             else:
                 s = bytes(self.uc.mem_read(address, int(length)))
@@ -1305,7 +1318,16 @@ class Unicorn(SimStatePlugin):
             stdout.write_data(string)
             i += 1
 
-        if unicorn_obj.stop_reason in {STOP.STOP_NORMAL, STOP.STOP_SYSCALL, STOP.STOP_SYMBOLIC_MEM_DEP_NOT_LIVE}:
+        # Re-execute concrete writes
+        count_of_writes_to_reexecute = _UC_NATIVE.get_count_of_writes_to_reexecute(self._uc_state)
+        if count_of_writes_to_reexecute > 0:
+            write_addrs = (ctypes.c_uint64 * count_of_writes_to_reexecute)()
+            write_values = (ctypes.c_uint8 * count_of_writes_to_reexecute)()
+            _UC_NATIVE.get_concrete_writes_to_reexecute(self._uc_state, write_addrs, write_values)
+            for address, value in zip(write_addrs, write_values):
+                state.memory.store(address, value, 1)
+
+        if unicorn_obj.stop_reason in {STOP.STOP_NORMAL, STOP.STOP_SYSCALL}:
             unicorn_obj.countdown_nonunicorn_blocks = 0
         elif unicorn_obj.stop_reason == STOP.STOP_STOPPOINT:
             unicorn_obj.countdown_nonunicorn_blocks = 0
@@ -1323,7 +1345,8 @@ class Unicorn(SimStatePlugin):
         else:
             unicorn_obj.countdown_nonunicorn_blocks = unicorn_obj.cooldown_nonunicorn_blocks
 
-        if not is_testing and unicorn_obj.time != 0 and unicorn_obj.steps / unicorn_obj.time < 10: # TODO: make this tunable
+        # TODO: make this tunable
+        if not is_testing and unicorn_obj.time != 0 and unicorn_obj.steps / unicorn_obj.time < 10:
             l.info(
                 "Unicorn stepped %d block%s in %fsec (%f blocks/sec), enabling cooldown",
                 unicorn_obj.steps,

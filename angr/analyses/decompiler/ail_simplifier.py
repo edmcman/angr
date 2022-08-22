@@ -61,7 +61,8 @@ class AILSimplifier(Analysis):
                  remove_dead_memdefs=False,
                  stack_arg_offsets: Optional[Set[Tuple[int,int]]]=None,
                  unify_variables=False,
-                 ail_manager: Optional['Manager']=None):
+                 ail_manager: Optional['Manager']=None,
+                 gp: Optional[int]=None):
         self.func = func
         self.func_graph = func_graph if func_graph is not None else func.graph
         self._reaching_definitions = None
@@ -71,6 +72,7 @@ class AILSimplifier(Analysis):
         self._stack_arg_offsets = stack_arg_offsets
         self._unify_vars = unify_variables
         self._ail_manager = ail_manager
+        self._gp = gp
 
         self._calls_to_remove: Set[CodeLocation] = set()
         self._assignments_to_remove: Set[CodeLocation] = set()
@@ -148,7 +150,7 @@ class AILSimplifier(Analysis):
         # Propagate expressions or return the existing result
         if self._propagator is not None:
             return self._propagator
-        prop = self.project.analyses.Propagator(func=self.func, func_graph=self.func_graph)
+        prop = self.project.analyses.Propagator(func=self.func, func_graph=self.func_graph, gp=self._gp)
         self._propagator = prop
         return prop
 
@@ -230,6 +232,12 @@ class AILSimplifier(Analysis):
                     for use_loc, use_expr in use_exprs:
                         old_block = addr_and_idx_to_block.get((use_loc.block_addr, use_loc.block_idx))
                         the_block = self.blocks.get(old_block, old_block)
+                        tags = use_expr.tags
+                        if "reg_name" not in tags:
+                            tags["reg_name"] = self.project.arch.translate_register_name(
+                                def_.atom.reg_offset,
+                                size=to_size * self.project.arch.byte_width
+                            )
                         new_use_expr = Register(use_expr.idx,
                                                 None,
                                                 def_.atom.reg_offset,
@@ -326,7 +334,7 @@ class AILSimplifier(Analysis):
         replaced = False
         for (block_addr, block_idx), reps in replacements_by_block_addrs_and_idx.items():
             block = blocks_by_addr_and_idx[(block_addr, block_idx)]
-            r, new_block = BlockSimplifier._replace_and_build(block, reps)
+            r, new_block = BlockSimplifier._replace_and_build(block, reps, gp=self._gp)
             replaced |= r
             self.blocks[block] = new_block
 
@@ -554,17 +562,20 @@ class AILSimplifier(Analysis):
                 old_block = addr_and_idx_to_block.get((u.block_addr, u.block_idx), None)
                 if old_block is None:
                     continue
+                if used_expr is None:
+                    all_uses_replaced = False
+                    continue
 
                 # if there is an updated block, use it
                 the_block = self.blocks.get(old_block, old_block)
                 stmt: Statement = the_block.statements[u.stmt_idx]
 
                 replace_with_copy = replace_with.copy()
-                if to_replace.size != replace_with_copy.size:
+                if used_expr.size != replace_with_copy.size:
                     new_idx = None if self._ail_manager is None else next(self._ail_manager.atom_ctr)
                     replace_with_copy = Convert(new_idx,
                                                 replace_with_copy.bits,
-                                                to_replace.bits,
+                                                used_expr.bits,
                                                 False,
                                                 replace_with_copy,
                                                 )

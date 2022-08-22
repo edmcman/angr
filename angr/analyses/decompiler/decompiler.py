@@ -22,16 +22,27 @@ if TYPE_CHECKING:
 
 l = logging.getLogger(name=__name__)
 
+_PEEPHOLE_OPTIMIZATIONS_TYPE = \
+    Optional[Iterable[Union[Type['PeepholeOptimizationStmtBase'],Type['PeepholeOptimizationExprBase']]]]
 
 class Decompiler(Analysis):
+    """
+    The decompiler analysis.
+
+    Run this on a Function object for which a normalized CFG has been constructed.
+    The fully processed output can be found in result.codegen.text
+    """
     def __init__(self, func, cfg=None, options=None, optimization_passes=None, sp_tracker_track_memory=True,
                  variable_kb=None,
-                 peephole_optimizations: Optional[Iterable[Union[Type['PeepholeOptimizationStmtBase'],Type['PeepholeOptimizationExprBase']]]]=None,
+                 peephole_optimizations: _PEEPHOLE_OPTIMIZATIONS_TYPE=None,
                  vars_must_struct: Optional[Set[str]]=None,
                  flavor='pseudocode',
                  expr_comments=None,
                  stmt_comments=None,
+                 ite_exprs=None,
+                 binop_operators=None,
                  decompile=True,
+                 regen_clinic=True,
                  ):
         self.func = func
         self._cfg = cfg
@@ -48,6 +59,9 @@ class Decompiler(Analysis):
         self._variable_kb = variable_kb
         self._expr_comments = expr_comments
         self._stmt_comments = stmt_comments
+        self._ite_exprs = ite_exprs
+        self._binop_operators = binop_operators
+        self._regen_clinic = regen_clinic
 
         self.clinic = None  # mostly for debugging purposes
         self.codegen = None
@@ -61,10 +75,18 @@ class Decompiler(Analysis):
         if self.func.is_simprocedure:
             return
 
+        # Load from cache
         try:
-            old_codegen = self.kb.structured_code[(self.func.addr, self._flavor)].codegen
+            cache = self.kb.structured_code[(self.func.addr, self._flavor)]
+            old_codegen = cache.codegen
+            old_clinic = cache.clinic
+            ite_exprs = cache.ite_exprs if self._ite_exprs is None else self._ite_exprs
+            binop_operators = cache.binop_operators if self._binop_operators is None else self._binop_operators
         except KeyError:
+            ite_exprs = self._ite_exprs
+            binop_operators = self._binop_operators
             old_codegen = None
+            old_clinic = None
 
         options_by_class = defaultdict(list)
 
@@ -88,23 +110,35 @@ class Decompiler(Analysis):
             reset_variable_names = self.func.addr not in variable_kb.variables.function_managers
 
         cache = DecompilationCache(self.func.addr)
+        cache.ite_exprs = ite_exprs
+        cache.binop_operators = binop_operators
 
         # convert function blocks to AIL blocks
-        clinic = self.project.analyses.Clinic(self.func,
-                                              kb=self.kb,
-                                              variable_kb=variable_kb,
-                                              reset_variable_names=reset_variable_names,
-                                              optimization_passes=self._optimization_passes,
-                                              sp_tracker_track_memory=self._sp_tracker_track_memory,
-                                              cfg=self._cfg,
-                                              peephole_optimizations=self._peephole_optimizations,
-                                              must_struct=self._vars_must_struct,
-                                              cache=cache,
-                                              progress_callback=lambda p, **kwargs: self._update_progress(p*(70-5)/100.+5, **kwargs),
-                                              **self.options_to_params(options_by_class['clinic'])
-                                              )
+        progress_callback = lambda p, **kwargs: self._update_progress(p * (70 - 5) / 100. + 5, **kwargs)
+
+        if self._regen_clinic or old_clinic is None or self.func.prototype is None:
+            clinic = self.project.analyses.Clinic(self.func,
+                                                  kb=self.kb,
+                                                  variable_kb=variable_kb,
+                                                  reset_variable_names=reset_variable_names,
+                                                  optimization_passes=self._optimization_passes,
+                                                  sp_tracker_track_memory=self._sp_tracker_track_memory,
+                                                  cfg=self._cfg,
+                                                  peephole_optimizations=self._peephole_optimizations,
+                                                  must_struct=self._vars_must_struct,
+                                                  cache=cache,
+                                                  progress_callback=progress_callback,
+                                                  **self.options_to_params(options_by_class['clinic'])
+                                                  )
+        else:
+            clinic = old_clinic
+            # reuse the old, unaltered graph
+            clinic.graph = clinic.cc_graph
+            clinic.cc_graph = clinic.copy_graph()
+
         self.clinic = clinic
         self.cache = cache
+        self._variable_kb = clinic.variable_kb
         self._update_progress(70., text='Identifying regions')
 
         if clinic.graph is None:
@@ -116,7 +150,8 @@ class Decompiler(Analysis):
         # recover regions
         ri = self.project.analyses.RegionIdentifier(self.func, graph=clinic.graph, cond_proc=cond_proc, kb=self.kb)
         # run optimizations that may require re-RegionIdentification
-        self.clinic.graph, ri = self._run_region_simplification_passes(clinic.graph, ri)
+        self.clinic.graph, ri = self._run_region_simplification_passes(clinic.graph, ri, clinic.reaching_definitions,
+                                                                       ite_exprs=ite_exprs)
         self._update_progress(75., text='Structuring code')
 
         # structure it
@@ -125,17 +160,22 @@ class Decompiler(Analysis):
 
         # simplify it
         s = self.project.analyses.RegionSimplifier(self.func, rs.result, kb=self.kb, variable_kb=clinic.variable_kb)
+        seq_node = s.result
+        seq_node = self._run_post_structuring_simplification_passes(seq_node, binop_operators=cache.binop_operators)
         self._update_progress(85., text='Generating code')
 
-        codegen = self.project.analyses.StructuredCodeGenerator(self.func, s.result, cfg=self._cfg,
-                                                                flavor=self._flavor,
-                                                                func_args=clinic.arg_list,
-                                                                kb=self.kb,
-                                                                variable_kb=clinic.variable_kb,
-                                                                expr_comments=old_codegen.expr_comments if old_codegen is not None else None,
-                                                                stmt_comments=old_codegen.stmt_comments if old_codegen is not None else None,
-                                                                externs=clinic.externs,
-                                                                **self.options_to_params(options_by_class['codegen']))
+        codegen = self.project.analyses.StructuredCodeGenerator(
+            self.func, seq_node, cfg=self._cfg,
+            flavor=self._flavor,
+            func_args=clinic.arg_list,
+            kb=self.kb,
+            variable_kb=clinic.variable_kb,
+            expr_comments=old_codegen.expr_comments if old_codegen is not None else None,
+            stmt_comments=old_codegen.stmt_comments if old_codegen is not None else None,
+            const_formats=old_codegen.const_formats if old_codegen is not None else None,
+            externs=clinic.externs,
+            **self.options_to_params(options_by_class['codegen'])
+        )
         self._update_progress(90., text='Finishing up')
 
         self.codegen = codegen
@@ -143,7 +183,7 @@ class Decompiler(Analysis):
         self.cache.clinic = self.clinic
 
     @timethis
-    def _run_region_simplification_passes(self, ail_graph, ri):
+    def _run_region_simplification_passes(self, ail_graph, ri, reaching_definitions, **kwargs):
         """
         Runs optimizations that should be executed after a single region identification. This function will return
         two items: the new RegionIdentifier object and the new AIL Graph, which should probably be written
@@ -152,11 +192,11 @@ class Decompiler(Analysis):
         Note: After each optimization run, if the optimization modifies the graph in any way then RegionIdentification
         will be run again.
 
-        @param ail_graph:   DiGraph with AIL Statements
-        @param ri:          RegionIdentifier
-        @return:            The possibly new AIL DiGraph and RegionIdentifier
+        :param ail_graph:   DiGraph with AIL Statements
+        :param ri:          RegionIdentifier
+        :param reaching_defenitions: ReachingDefenitionAnalysis
+        :return:            The possibly new AIL DiGraph and RegionIdentifier
         """
-        cond_proc = ri.cond_proc
         addr_and_idx_to_blocks: Dict[Tuple[int, Optional[int]], ailment.Block] = {}
         addr_to_blocks: Dict[int, Set[ailment.Block]] = defaultdict(set)
 
@@ -174,27 +214,48 @@ class Decompiler(Analysis):
             if pass_.STAGE != OptimizationPassStage.DURING_REGION_IDENTIFICATION:
                 continue
 
-            analysis = getattr(self.project.analyses, pass_.__name__)
-            a = analysis(self.func, blocks_by_addr=addr_to_blocks, blocks_by_addr_and_idx=addr_and_idx_to_blocks,
-                         graph=ail_graph, region_identifier=ri)
+            a = pass_(self.func, blocks_by_addr=addr_to_blocks, blocks_by_addr_and_idx=addr_and_idx_to_blocks,
+                      graph=ail_graph, variable_kb=self._variable_kb, region_identifier=ri,
+                      reaching_definitions=reaching_definitions, **kwargs)
 
             # should be None if no changes
             if a.out_graph:
                 # use the new graph
                 ail_graph = a.out_graph
+
+                cond_proc = ConditionProcessor(self.project.arch)
                 # always update RI on graph change
                 ri = self.project.analyses.RegionIdentifier(self.func, graph=ail_graph, cond_proc=cond_proc,
                                                             kb=self.kb)
 
         return ail_graph, ri
 
+    @timethis
+    def _run_post_structuring_simplification_passes(self, seq_node, **kwargs):
+
+        for pass_ in self._optimization_passes:
+
+            if pass_.STAGE != OptimizationPassStage.AFTER_STRUCTURING:
+                continue
+
+            a = pass_(self.func, seq=seq_node, **kwargs)
+            if a.out_seq:
+                seq_node = a.out_seq
+
+        return seq_node
+
     def _set_global_variables(self):
 
         global_variables = self.kb.variables['global']
         for symbol in self.project.loader.main_object.symbols:
             if symbol.type == SymbolType.TYPE_OBJECT:
-                global_variables.set_variable('global', symbol.rebased_addr, SimMemoryVariable(symbol.rebased_addr, 1,
-                                                                                               name=symbol.name))
+                ident = global_variables.next_variable_ident('global')
+                global_variables.set_variable('global', symbol.rebased_addr, SimMemoryVariable(
+                    symbol.rebased_addr,
+                    1,
+                    name=symbol.name,
+                    ident=ident
+                ))
 
     def reflow_variable_types(self, type_constraints: Set, var_to_typevar: Dict, codegen):
         """
