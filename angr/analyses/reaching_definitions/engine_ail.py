@@ -41,6 +41,32 @@ class SimEngineRDAIL(
         self._visited_blocks = None
         self._dep_graph = None
 
+        self._stmt_handlers = {
+            ailment.Stmt.Assignment: self._ail_handle_Assignment,
+            ailment.Stmt.Store: self._ail_handle_Store,
+            ailment.Stmt.Jump: self._ail_handle_Jump,
+            ailment.Stmt.ConditionalJump: self._ail_handle_ConditionalJump,
+            ailment.Stmt.Call: self._ail_handle_Call,
+            ailment.Stmt.Return: self._ail_handle_Return,
+            ailment.Stmt.DirtyStatement: self._ail_handle_DirtyStatement,
+        }
+
+        self._expr_handlers = {
+            claripy.ast.BV: self._ail_handle_BV,
+            ailment.Expr.Tmp: self._ail_handle_Tmp,
+            ailment.Stmt.Call: self._ail_handle_CallExpr,
+            ailment.Expr.Register: self._ail_handle_Register,
+            ailment.Expr.Load: self._ail_handle_Load,
+            ailment.Expr.Convert: self._ail_handle_Convert,
+            ailment.Expr.Reinterpret: self._ail_handle_Reinterpret,
+            ailment.Expr.ITE: self._ail_handle_ITE,
+            ailment.Expr.UnaryOp: self._ail_handle_UnaryOp,
+            ailment.Expr.BinaryOp: self._ail_handle_BinaryOp,
+            ailment.Expr.Const: self._ail_handle_Const,
+            ailment.Expr.StackBaseOffset: self._ail_handle_StackBaseOffset,
+            ailment.Expr.DirtyExpression: self._ail_handle_DirtyExpression,
+        }
+
     def process(self, state, *args, **kwargs):
         self._dep_graph = kwargs.pop('dep_graph', None)
         self._visited_blocks = kwargs.pop('visited_blocks', None)
@@ -78,10 +104,22 @@ class SimEngineRDAIL(
         if self.state.analysis:
             self.state.analysis.insn_observe(self.ins_addr, stmt, self.block, self.state, OP_BEFORE)
 
-        super()._handle_Stmt(stmt)
+        handler = self._stmt_handlers.get(type(stmt), None)
+        if handler is not None:
+            handler(stmt)
+        else:
+            self.l.warning('Unsupported statement type %s.', type(stmt).__name__)
 
         if self.state.analysis:
             self.state.analysis.insn_observe(self.ins_addr, stmt, self.block, self.state, OP_AFTER)
+
+    def _expr(self, expr):
+        handler = self._expr_handlers.get(type(expr), None)
+        if handler is not None:
+            return handler(expr)
+        else:
+            self.l.warning('Unsupported expression type %s.', type(expr).__name__)
+            return None
 
     def _ail_handle_Assignment(self, stmt):
         """
@@ -193,11 +231,17 @@ class SimEngineRDAIL(
             l.debug("Unknown calling convention for function %s. Fall back to default calling convention.", target)
             cc = self.project.factory.cc()
 
-        killed_vars = [ Register(*self.arch.registers[reg_name]) for reg_name in cc.CALLER_SAVED_REGS ]
+        killed_vars = [ ailment.Expr.Register(None, None,
+                                              self.arch.registers[reg_name][0],
+                                              self.arch.registers[reg_name][1] * self.arch.byte_width)
+                        for reg_name in cc.CALLER_SAVED_REGS ]
 
         # Add uses
         if used_exprs is None:
-            used_exprs = [ Register(*self.arch.registers[reg_name]) for reg_name in cc.ARG_REGS ]
+            used_exprs = [ ailment.Expr.Register(None, None,
+                                                 self.arch.registers[reg_name][0],
+                                                 self.arch.registers[reg_name][1] * self.arch.byte_width)
+                           for reg_name in cc.ARG_REGS ]
         for expr in used_exprs:
             self._expr(expr)
 
@@ -232,7 +276,7 @@ class SimEngineRDAIL(
             if var.reg_offset == return_reg_offset:
                 # Skip the return variable
                 continue
-            self.state.kill_definitions(var)
+            self.state.kill_definitions(Register(var.reg_offset, var.size))
 
         # kill all cc_ops
         if 'cc_op' in self.arch.registers:
@@ -484,11 +528,29 @@ class SimEngineRDAIL(
         operand: MultiValues = self._expr(expr.operand)
         bits = expr.bits
 
-        r = None
+        if operand is None:
+            return MultiValues(offset_to_values={0: {self.state.top(bits)}})
+
         operand_v = operand.one_value()
 
         if operand_v is not None and operand_v.concrete:
             r = MultiValues(offset_to_values={0: {~operand_v}})
+        else:
+            r = MultiValues(offset_to_values={0: {self.state.top(bits)}})
+
+        return r
+
+    def _ail_handle_Neg(self, expr: ailment.Expr.UnaryOp) -> MultiValues:
+        operand: MultiValues = self._expr(expr.operand)
+        bits = expr.bits
+
+        if operand is None:
+            return MultiValues(offset_to_values={0: {self.state.top(bits)}})
+
+        operand_v = operand.one_value()
+
+        if operand_v is not None and operand_v.concrete:
+            r = MultiValues(offset_to_values={0: {-operand_v}})
         else:
             r = MultiValues(offset_to_values={0: {self.state.top(bits)}})
 
@@ -593,6 +655,17 @@ class SimEngineRDAIL(
         return r
 
     def _ail_handle_Mull(self, expr):
+
+        arg0, arg1 = expr.operands
+
+        self._expr(arg0)
+        self._expr(arg1)
+        bits = expr.bits
+
+        r = MultiValues(offset_to_values={0: {self.state.top(bits)}})
+        return r
+
+    def _ail_handle_Mod(self, expr):
 
         arg0, arg1 = expr.operands
 
@@ -773,6 +846,40 @@ class SimEngineRDAIL(
         if r is None:
             r = MultiValues(offset_to_values={0: {self.state.top(bits)}})
 
+        return r
+
+    def _ail_handle_LogicalAnd(self, expr: ailment.Expr.BinaryOp) -> MultiValues:
+        expr0: MultiValues = self._expr(expr.operands[0])
+        expr1: MultiValues = self._expr(expr.operands[1])
+        bits = expr.bits
+
+        r = None
+        expr0_v = expr0.one_value()
+        expr1_v = expr1.one_value()
+
+        # TODO: can maybe be smarter about this. if we can determine that expr0 is never falsey, we can just return it,
+        # TODO: or if it's always falsey we can return expr1 (did I get this backwards?)
+        if expr0_v is None or expr1_v is None:
+            r = MultiValues(offset_to_values={0: {self.state.top(bits)}})
+            return r
+
+        r = MultiValues(offset_to_values={0: {claripy.If(expr0_v == 0, expr0_v, expr1_v)}})
+        return r
+
+    def _ail_handle_LogicalOr(self, expr: ailment.Expr.BinaryOp) -> MultiValues:
+        expr0: MultiValues = self._expr(expr.operands[0])
+        expr1: MultiValues = self._expr(expr.operands[1])
+        bits = expr.bits
+
+        r = None
+        expr0_v = expr0.one_value()
+        expr1_v = expr1.one_value()
+
+        if expr0_v is None or expr1_v is None:
+            r = MultiValues(offset_to_values={0: {self.state.top(bits)}})
+            return r
+
+        r = MultiValues(offset_to_values={0: {claripy.If(expr0_v != 0, expr0_v, expr1_v)}})
         return r
 
     def _ail_handle_Xor(self, expr: ailment.Expr.BinaryOp) -> MultiValues:

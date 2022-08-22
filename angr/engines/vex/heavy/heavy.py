@@ -42,7 +42,7 @@ class SimStateStorageMixin(VEXMixin):
             self.state.memory.store(addr, concrete_data, endness=endness, action=None, inspect=False,
                                     condition=condition)
 
-        self.state.memory.store(addr, data, endness=endness, action=action, inspect=inspect, condition=condition)
+        self.state.memory.store(addr, data, size=data.size() // 8, endness=endness, action=action, inspect=inspect, condition=condition)
 
     def _perform_vex_stmt_WrTmp(self, tmp, data, deps=None):
         self.state.scratch.store_tmp(tmp, data, deps=deps)
@@ -115,12 +115,13 @@ class HeavyVEXMixin(SuccessorsMixin, ClaripyDataMixin, SimStateStorageMixin, VEX
                     extra_stop_points=extra_stop_points,
                     opt_level=opt_level)
 
-            if irsb.size == 0:
-                if irsb.jumpkind == 'Ijk_NoDecode' and not self.state.project.is_hooked(irsb.addr):
-                    raise errors.SimIRSBNoDecodeError(f"IR decoding error at 0x{addr:02x}. You can hook this "
-                                                      "instruction with a python replacement using project.hook"
-                                                      f"(0x{addr:02x}, your_function, length=length_of_instruction).")
+            if irsb.jumpkind == 'Ijk_NoDecode' and irsb.next.con.value == irsb.addr \
+                    and not self.state.project.is_hooked(irsb.addr):
+                raise errors.SimIRSBNoDecodeError(f"IR decoding error at 0x{addr:02x}. You can hook this "
+                                                  "instruction with a python replacement using project.hook"
+                                                  f"(0x{addr:02x}, your_function, length=length_of_instruction).")
 
+            if irsb.size == 0:
                 raise errors.SimIRSBError("Empty IRSB passed to HeavyVEXMixin.")
 
             # check permissions, are we allowed to execute here? Do we care?
